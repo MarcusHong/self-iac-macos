@@ -1,0 +1,209 @@
+# ================================================
+# GitLab CE Helm Values
+# 호스트 PostgreSQL 18 + Valkey + MinIO
+# ================================================
+
+global:
+  edition: ce
+  hosts:
+    # TS_HOSTNAME으로 치환됨 (02-k8s.sh)
+    domain: TS_HOSTNAME_PLACEHOLDER
+    gitlab:
+      name: TS_HOSTNAME_PLACEHOLDER
+    # 외부 URL은 HTTPS지만, Ingress 단에서 TLS는 Traefik이 처리
+    https: true
+    registry:
+      name: TS_HOSTNAME_PLACEHOLDER
+      https: true
+
+  ingress:
+    configureCertmanager: false
+    class: traefik
+    tls:
+      enabled: false
+
+  # ── 외부 PostgreSQL (호스트) ──
+  psql:
+    host: host.docker.internal
+    port: 5432
+    username: gitlab
+    password:
+      secret: gitlab-postgres-secret
+      key: password
+    database: gitlab
+
+  # ── 외부 Valkey (호스트) ──
+  redis:
+    host: host.docker.internal
+    port: 6379
+    auth:
+      enabled: false
+
+  # ── 외부 MinIO (호스트) ──
+  minio:
+    enabled: false
+
+  # ── SMTP (Gmail) ──
+  smtp:
+    enabled: SMTP_ENABLED_PLACEHOLDER
+    address: smtp.gmail.com
+    port: 587
+    authentication: plain
+    user_name: SMTP_USER_PLACEHOLDER
+    password:
+      secret: gitlab-smtp-secret
+      key: password
+    starttls_auto: true
+  email:
+    from: SMTP_USER_PLACEHOLDER
+    reply_to: SMTP_USER_PLACEHOLDER
+
+  kas:
+    enabled: false
+
+  # ── API Rate Limit 완화 (LLM 자동화용) ──
+  appConfig:
+    applicationSettingsCacheSeconds: 60
+    object_store:
+      enabled: true
+      connection:
+        secret: gitlab-minio-secret
+        key: connection
+    terraformState:
+      enabled: true
+
+installCertmanager: false
+
+certmanager-issuer:
+  email: false
+
+# ── 서브차트 비활성화 ──
+nginx-ingress:
+  enabled: false
+
+prometheus:
+  install: false
+
+postgresql:
+  install: false
+
+redis:
+  install: false
+
+minio:
+  install: false
+
+# ── GitLab Runner ──
+gitlab-runner:
+  install: true
+  gitlabUrl: http://gitlab-webservice-default.gitlab.svc.cluster.local:8080
+  runners:
+    privileged: true
+    cache:
+      cacheType: s3
+      s3BucketName: gitlab-runner-cache
+      s3BucketLocation: us-east-1
+      s3ServerAddress: host.docker.internal:9000
+      s3Insecure: true
+      secretName: gitlab-runner-cache-secret
+      cacheShared: true
+    config: |
+      [[runners]]
+        [runners.kubernetes]
+          namespace = "gitlab"
+          image = "ubuntu:24.04"
+          privileged = true
+
+# ── GitLab 컴포넌트 리소스 ──
+gitlab:
+  webservice:
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    resources:
+      requests:
+        cpu: 300m
+        memory: 1200Mi
+      limits:
+        cpu: 1500m
+        memory: 2Gi
+    workerProcesses: 1
+
+  sidekiq:
+    replicas: 1
+    minReplicas: 1
+    maxReplicas: 1
+    concurrency: 20
+    resources:
+      requests:
+        cpu: 150m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+  gitaly:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+    persistence:
+      enabled: true
+      size: 50Gi
+
+  gitlab-shell:
+    enabled: false
+
+  toolbox:
+    replicas: 1
+    backups:
+      cron:
+        enabled: true
+        schedule: "0 4 * * *"
+        extraArgs: "--skip artifacts"
+      objectStorage:
+        config:
+          secret: gitlab-minio-secret
+          key: connection
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+
+  kas:
+    enabled: false
+
+  gitlab-pages:
+    enabled: false
+
+# ── Registry (LoadBalancer, Ingress 미사용) ──
+registry:
+  enabled: true
+  replicas: 1
+  hpa:
+    minReplicas: 1
+    maxReplicas: 1
+  ingress:
+    enabled: false
+  service:
+    type: LoadBalancer
+  storage:
+    secret: gitlab-registry-storage
+    key: config
+  maintenance:
+    gc:
+      disabled: false
+      schedule: "0 5 * * 0"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
