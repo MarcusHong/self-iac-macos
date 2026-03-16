@@ -5,7 +5,7 @@ GitLab CE를 중심으로 GitOps 파이프라인을 구성한다.
 
 ## 개요
 
-Mac Mini를 headless 서버로 운영하며, 호스트에 데이터 레이어(PostgreSQL, Valkey, MinIO, OpenBao)를
+headless 서버로 운영하며, 호스트에 데이터 레이어(PostgreSQL, Valkey, MinIO, OpenBao)를
 네이티브로 설치하고 OrbStack K8s 위에 워크로드(Traefik, GitLab, Flux)를 배포한다.
 
 외부 접근은 Tailscale VPN 메시를 통해 이루어지며, Let's Encrypt 정식 인증서로 HTTPS를 제공한다.
