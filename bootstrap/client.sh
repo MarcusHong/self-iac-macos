@@ -35,19 +35,7 @@ ORBSTACK_HOST="${ORBSTACK_SSH#*@}"
 ssh -o ConnectTimeout=5 "$ORBSTACK_SSH" "true" 2>/dev/null || err "SSH 연결 실패: $ORBSTACK_SSH"
 log "SSH 연결 OK"
 
-# ── 2. OrbStack K8s API 외부 노출 ──
-step "OrbStack 설정"
-
-EXPOSE_STATUS=$(ssh "$ORBSTACK_SSH" "export PATH=/usr/local/bin:/opt/homebrew/bin:\$PATH && orbctl config get k8s.expose_services" 2>/dev/null || echo "unknown")
-if [ "$EXPOSE_STATUS" != "true" ]; then
-  warn "k8s.expose_services 비활성화 — 활성화합니다"
-  ssh "$ORBSTACK_SSH" "export PATH=/usr/local/bin:/opt/homebrew/bin:\$PATH && orbctl config set k8s.expose_services true && orbctl stop && orbctl start" || err "원격 OrbStack 설정 실패"
-  echo "  OrbStack 재시작 대기 중..."
-  sleep 10
-fi
-log "k8s.expose_services 활성화됨"
-
-# ── 3. kubeconfig 구성 ──
+# ── 2. kubeconfig 구성 ──
 step "kubeconfig 구성"
 
 # 기존 orbstack context 제거 (재등록 대응)
