@@ -6,7 +6,7 @@ set -uo pipefail
 #
 #   ① Traefik (TLS 종단)
 #   ② GitLab CE (Helm, INSTALL_GITLAB=true 일 때만)
-#   ③ Flux 부트스트랩 (GitLab을 소스로 쓰므로 INSTALL_GITLAB=true 일 때만)
+#   ③ Argo CD (GitOps) + k8s/ 플랫폼 매니페스트 직접 적용
 #
 # 01-data.sh가 실행 중이어야 함
 # INSTALL_GITLAB 기본값: false (01-data.sh와 같은 값으로 실행)
@@ -34,20 +34,13 @@ OPENBAO_DATA_DIR="$HOME/.local/share/openbao"
 # Helm 차트 버전 (고정)
 TRAEFIK_CHART_VERSION="42.0.0"   # Traefik v3.7.14
 GITLAB_CHART_VERSION="10.5.0"    # GitLab 19.5.0
-
-FLUX_OWNER="infra"
-FLUX_REPO="infra"
-FLUX_BRANCH="main"
-FLUX_PATH="clusters/mac-mini"
+ARGOCD_CHART_VERSION="10.10.5"   # Argo CD v3.5.5
 
 step "1/4 사전 체크"
 
 for cmd in kubectl helm; do
     command -v "$cmd" &>/dev/null || err "$cmd 필요"
 done
-if [ "$INSTALL_GITLAB" = "true" ]; then
-    command -v flux &>/dev/null || err "flux 필요"
-fi
 
 if ! kubectl cluster-info &>/dev/null; then
     err "K8s 클러스터 연결 실패 (OrbStack K8s 활성화 확인)"
@@ -239,39 +232,39 @@ EOF
     done
 fi
 
-step "4/4 Flux 부트스트랩"
+step "4/4 Argo CD"
 
-if [ "$INSTALL_GITLAB" != "true" ]; then
-    log "건너뜀 — Flux는 GitLab을 소스로 사용 (INSTALL_GITLAB=true 필요)"
-else
-    if [ -z "${GITLAB_TOKEN:-}" ]; then
-        echo ""
-        echo "  GitLab Personal Access Token이 필요합니다."
-        echo "  https://${GITLAB_HOST} → User Settings → Access Tokens"
-        echo "  Scopes: api, read_repository, write_repository"
-        echo ""
-        read -rp "  토큰 입력: " GITLAB_TOKEN
-        export GITLAB_TOKEN
-    fi
+kubectl create namespace argocd 2>/dev/null || true
 
-    [ -z "$GITLAB_TOKEN" ] && err "GITLAB_TOKEN 필요"
+# builders-starter-iac와 같은 구성: Argo CD는 Helm으로 설치하고,
+# AppProject·Ingress·서비스 Application은 k8s/에서 직접 적용 (IaC 저장소는 Argo CD source가 아님)
+helm upgrade --install argocd oci://ghcr.io/argoproj/argo-helm/argo-cd \
+    --version "$ARGOCD_CHART_VERSION" \
+    --namespace argocd \
+    -f "$SCRIPT_DIR/argocd-values.yaml" \
+    --set global.domain="$TS_HOSTNAME" \
+    --set configs.cm.url="https://${TS_HOSTNAME}/argocd" \
+    --wait --timeout 10m || err "Argo CD 설치 실패"
 
-    bao kv patch infra/gitlab pat="$GITLAB_TOKEN" 2>/dev/null || bao kv put infra/gitlab pat="$GITLAB_TOKEN" 2>/dev/null || true
-    log "GitLab PAT → OpenBao 저장"
+log "Argo CD 설치 완료"
 
-    flux check --pre || err "Flux 사전 체크 실패"
+TS_HOSTNAME="$TS_HOSTNAME" "$SCRIPT_DIR/../k8s/deploy.sh" || err "k8s/ 플랫폼 매니페스트 적용 실패"
+log "Argo CD UI — https://${TS_HOSTNAME}/argocd"
 
-    flux bootstrap gitlab \
-        --hostname="$GITLAB_HOST" \
-        --owner="$FLUX_OWNER" \
-        --repository="$FLUX_REPO" \
-        --branch="$FLUX_BRANCH" \
-        --path="$FLUX_PATH" \
-        --token-auth \
-        --personal || err "Flux 부트스트랩 실패"
+ARGOCD_ADMIN_PW=$(kubectl get secret argocd-initial-admin-secret \
+    -n argocd -ojsonpath='{.data.password}' 2>/dev/null | base64 --decode || echo "")
 
-    log "Flux 부트스트랩 완료!"
+if [ -n "$ARGOCD_ADMIN_PW" ]; then
+    echo ""
+    echo "  Argo CD admin 비밀번호: ${ARGOCD_ADMIN_PW}"
+    echo ""
+    bao kv put infra/argocd admin_password="$ARGOCD_ADMIN_PW" 2>/dev/null || true
+    log "Argo CD 비밀번호 → OpenBao 저장"
 fi
+
+echo ""
+echo "  서비스 배포: 서비스 CI가 *-deploy OCI 아티팩트를 발행하고, 서비스별 Application이 동기화합니다."
+echo "    k8s/_template/service → k8s/services/<service> 복사 후 ./k8s/deploy.sh (docs/argocd.md)"
 
 echo ""
 kubectl get pods -n traefik 2>/dev/null
@@ -279,8 +272,8 @@ echo ""
 if [ "$INSTALL_GITLAB" = "true" ]; then
     kubectl get pods -n gitlab 2>/dev/null
     echo ""
-    kubectl get pods -n flux-system 2>/dev/null
 fi
+kubectl get pods -n argocd 2>/dev/null
 
 echo ""
 echo "  ┌──────────────────────────────────────────────┐"
@@ -294,7 +287,7 @@ echo "  │  K8s                                         │"
 echo "  │  ├─ Traefik   https://${TS_HOSTNAME}"
 if [ "$INSTALL_GITLAB" = "true" ]; then
 echo "  │  ├─ GitLab    https://${GITLAB_HOST}"
-echo "  │  └─ Flux      → ${FLUX_OWNER}/${FLUX_REPO}"
 fi
+echo "  │  └─ Argo CD   https://${TS_HOSTNAME}/argocd"
 echo "  └──────────────────────────────────────────────┘"
 echo ""

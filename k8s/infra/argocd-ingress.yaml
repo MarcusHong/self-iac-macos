@@ -1,0 +1,21 @@
+# Argo CD UI — Traefik(websecure)에서 TLS 종료 후 HTTP로 전달한다.
+# server.insecure=true, server.rootpath=/argocd는 bootstrap/argocd-values.yaml에서 설정.
+# GitLab(/)과 같은 Tailscale 호스트를 쓰므로 host와 /argocd 경로를 모두 지정한다.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-server
+  namespace: argocd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: ${TS_HOSTNAME}
+      http:
+        paths:
+          - path: /argocd
+            pathType: Prefix
+            backend:
+              service:
+                name: argocd-server
+                port:
+                  number: 80

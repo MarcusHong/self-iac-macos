@@ -1,0 +1,10 @@
+# k8s/deploy.sh가 렌더 후 ${...} 토큰을 실제 값으로 치환해 직접 적용합니다.
+# 이 디렉터리는 Argo CD source가 아닙니다.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - projects/platform.yaml
+  - projects/apps.yaml
+  - infra
+  - services

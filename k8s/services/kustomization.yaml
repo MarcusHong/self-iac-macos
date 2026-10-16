@@ -1,0 +1,6 @@
+# 서비스별 OCI Application 목록
+# 새 서비스: k8s/_template/service를 k8s/services/<service>로 복사해 CHANGEME를 채우고
+# 아래 resources에 디렉터리를 추가한 뒤 ./k8s/deploy.sh 실행
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: []

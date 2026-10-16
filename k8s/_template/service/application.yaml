@@ -1,0 +1,31 @@
+# 서비스 빌드 시스템이 OCI 루트에 렌더링된 매니페스트 아티팩트를 발행합니다.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: apps-CHANGEME
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/compare-options: ServerSideDiff=true
+spec:
+  project: apps
+  source:
+    # repository.yaml의 url과 같은 값
+    repoURL: oci://CHANGEME
+    # 이동 태그(development/production) 또는 불변 태그(dev-SHA7, vYYYY.MM.N), digest
+    targetRevision: development
+    path: .
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: apps
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+    retry:
+      limit: -1
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

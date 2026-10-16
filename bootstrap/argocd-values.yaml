@@ -1,0 +1,73 @@
+# ================================================
+# Argo CD Helm Values (chart 10.10.5 / Argo CD v3.5.5)
+# builders-starter-iac의 Argo CD 구성을 따른다.
+#
+# UI는 k8s/infra/argocd-ingress.yaml(Traefik)로 https://<TS_HOSTNAME>/argocd 에 노출
+# (global.domain, configs.cm.url은 02-k8s.sh에서 주입)
+# ================================================
+
+dex:
+  enabled: false
+
+applicationSet:
+  replicas: 0
+
+# 컨트롤러만 활성화 — notifier 자격증명, trigger/template, 구독은 별도 설정
+notifications:
+  enabled: true
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+configs:
+  cm:
+    timeout.reconciliation: 60s
+  params:
+    # TLS는 Traefik에서 종단
+    server.insecure: true
+    # GitLab이 / 를 사용하므로 하위 경로로 서빙
+    server.rootpath: /argocd
+    server.basehref: /argocd
+    # 서비스 배포 OCI 아티팩트(ORAS tar / tar+gzip)와 Helm OCI 차트
+    reposerver.oci.layer.media.types: application/vnd.oci.image.layer.v1.tar,application/vnd.oci.image.layer.v1.tar+gzip,application/vnd.cncf.helm.chart.content.v1.tar+gzip
+
+# ── 단일 노드 리소스 ──
+server:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+controller:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+repoServer:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+redis:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi

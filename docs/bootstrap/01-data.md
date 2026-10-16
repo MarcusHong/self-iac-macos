@@ -124,7 +124,8 @@ Homebrew 설치가 실패하면 GitHub 릴리스의 `openbao_<버전>_darwin_<ar
 | `infra/postgresql` | root 유저 + 패스워드 (GitLab 사용 시 gitlab 유저 포함) |
 | `infra/minio` | MinIO root 자격증명 |
 | `infra/valkey` | Valkey 접속 정보 |
-| `infra/gitlab` | GitLab root 비밀번호, PAT (`02-k8s.sh`, GitLab 사용 시) |
+| `infra/argocd` | Argo CD admin 비밀번호 (`02-k8s.sh`가 저장) |
+| `infra/gitlab` | GitLab root 비밀번호 (`02-k8s.sh`, GitLab 사용 시) |
 
 **UI 접속:** http://localhost:8200/ui (Root Token으로 로그인)
 

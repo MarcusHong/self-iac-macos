@@ -1,0 +1,21 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: apps
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: Service applications
+  sourceRepos:
+    - "*"
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: apps
+  namespaceResourceBlacklist:
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+    - group: external-secrets.io
+      kind: SecretStore
+    - group: generators.external-secrets.io
+      kind: "*"

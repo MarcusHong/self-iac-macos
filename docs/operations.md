@@ -8,6 +8,7 @@
 | Valkey | `valkey-cli` |
 | MinIO Console | http://localhost:9001 |
 | OpenBao UI | http://localhost:8200/ui |
+| Argo CD | https://<tailscale-hostname>/argocd |
 | GitLab (선택) | https://<tailscale-hostname> |
 | Registry (GitLab 사용 시) | `kubectl get svc gitlab-registry -n gitlab` (LoadBalancer IP:5000) |
 
@@ -53,6 +54,7 @@ brew services restart valkey
 
 # K8s 워크로드
 kubectl rollout restart deployment -n traefik
+kubectl rollout restart deployment -n argocd
 kubectl rollout restart deployment -n gitlab   # GitLab 사용 시
 ```
 
@@ -92,8 +94,9 @@ rm -rf ~/.local/share/minio ~/.config/minio/env
 
 # 3. K8s 워크로드 삭제
 helm uninstall gitlab -n gitlab   # GitLab 사용 시
+helm uninstall argocd -n argocd
 helm uninstall traefik -n traefik
-kubectl delete ns gitlab traefik
+kubectl delete ns gitlab argocd traefik
 
 # 4. PostgreSQL gitlab DB 재생성
 brew services start postgresql@18
@@ -107,23 +110,22 @@ psql -d postgres -c "DROP ROLE IF EXISTS gitlab; DROP ROLE IF EXISTS root;"
 
 **`init-keys.json`은 반드시 별도 백업할 것.**
 
-## Flux GitOps 워크플로우 (GitLab 사용 시)
+## Argo CD
+
+플랫폼 매니페스트(`k8s/`)는 직접 적용하고, 서비스는 `*-deploy` OCI 아티팩트로 배포한다.
+자세한 내용은 [Argo CD 운영](argocd.md) 참고.
 
 ```bash
-# infra 레포 클론
-git clone https://<tailscale-hostname>/infra/infra.git
-cd infra
+# k8s/ 변경 후 다시 적용
+./k8s/deploy.sh
 
-# 매니페스트 추가/수정
-vim clusters/mac-mini/my-service.yaml
+# 새 서비스 등록
+cp -R k8s/_template/service k8s/services/<service>
+#   CHANGEME 채우고 k8s/services/kustomization.yaml resources에 추가
+./k8s/deploy.sh
 
-# push → Flux 자동 배포
-git add -A
-git commit -m "feat: add my-service"
-git push origin main
-
-# 동기화 확인
-flux get kustomizations
+# 상태 확인
+kubectl -n argocd get appprojects,applications
 ```
 
 ## SMTP (Gmail) 설정
@@ -151,8 +153,9 @@ kubectl logs -f deployment/gitlab-webservice-default -n gitlab
 # Traefik
 kubectl logs -f deployment/traefik -n traefik
 
-# Flux (GitLab 사용 시)
-flux logs
+# Argo CD
+kubectl logs -f deployment/argocd-server -n argocd
+kubectl logs -f statefulset/argocd-application-controller -n argocd
 
 # OpenBao
 tail -f ~/.local/share/openbao/openbao.log

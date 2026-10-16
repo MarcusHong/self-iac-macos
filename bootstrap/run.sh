@@ -6,7 +6,7 @@ set -uo pipefail
 #
 #   00 → Prerequisites (Xcode CLT, Homebrew, OrbStack, Tailscale)
 #   01 → Data (PostgreSQL, Valkey, MinIO, OpenBao, TLS)
-#   02 → K8s  (Traefik, GitLab, Flux)
+#   02 → K8s  (Traefik, GitLab, Argo CD)
 #
 # GitLab은 선택 사항 (기본값: false)
 #   INSTALL_GITLAB=true ./bootstrap/run.sh

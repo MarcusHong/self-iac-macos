@@ -58,8 +58,8 @@ log "kubectl OK"
 command -v helm &>/dev/null || { echo "  Helm 설치 중..."; brew install helm; }
 log "Helm OK"
 
-command -v flux &>/dev/null || { echo "  flux CLI 설치 중..."; brew install fluxcd/tap/flux; }
-log "flux CLI OK"
+command -v argocd &>/dev/null || { echo "  Argo CD CLI 설치 중..."; brew install argocd; }
+log "Argo CD CLI OK"
 
 if [ "$INSTALL_GITLAB" = "true" ]; then
     log "GitLab 리소스 포함 (INSTALL_GITLAB=true)"
