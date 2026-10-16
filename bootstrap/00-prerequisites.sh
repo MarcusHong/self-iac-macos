@@ -109,13 +109,20 @@ else
   warn "설치 시작"
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-  # Apple Silicon 경로 추가
+  # Apple Silicon 경로 추가 (이 프로세스용)
   if [[ -f /opt/homebrew/bin/brew ]]; then
     eval "$(/opt/homebrew/bin/brew shellenv)"
   fi
 
   command -v brew &>/dev/null || err "Homebrew 설치 실패"
   log "설치 완료: $(brew --version | head -1)"
+fi
+
+# Apple Silicon: 새 로그인 셸에서도 brew를 찾도록 ~/.zprofile에 등록
+# (01/02 스크립트는 자체적으로 /opt/homebrew를 PATH에 추가함)
+if [[ -f /opt/homebrew/bin/brew ]] && ! grep -qs 'brew shellenv' ~/.zprofile; then
+  echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
+  log "~/.zprofile에 Homebrew 경로 등록"
 fi
 
 # ── ③ OrbStack (K8s) ──
@@ -182,6 +189,17 @@ else
   warn "설치 시작"
   brew install tailscale || err "Tailscale 설치 실패"
   log "설치 완료"
+fi
+
+# brew 포뮬러는 tailscaled 데몬을 자동으로 시작하지 않음 (root 서비스로 등록 필요)
+if brew list --formula tailscale &>/dev/null; then
+  if ! sudo brew services info tailscale --json 2>/dev/null \
+      | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin)[0].get('running') else 1)" 2>/dev/null; then
+    warn "tailscaled 미실행 — 서비스로 시작"
+    sudo brew services start tailscale || err "tailscaled 시작 실패"
+    sleep 3
+  fi
+  log "tailscaled 실행 중"
 fi
 
 if tailscale status &>/dev/null; then

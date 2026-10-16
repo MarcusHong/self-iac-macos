@@ -43,6 +43,9 @@ CERT_DIR="$HOME/.local/share/tailscale-certs"
 
 gen_pass() { openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32; }
 
+# Apple Silicon Homebrew(/opt/homebrew)는 기본 PATH에 없음 — run.sh나 새 셸에서 실행해도 찾도록
+[ -x /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)"
+
 step "1/7 사전 체크"
 
 command -v brew &>/dev/null || err "Homebrew 필요: https://brew.sh"
@@ -151,7 +154,7 @@ if [ "$INSTALL_GITLAB" = "true" ] && { [ "$GITLAB_EXISTS" != "1" ] || [ "$PG_RES
 fi
 
 if [ -n "$PG_ROOT_PASS" ]; then
-    psql -d postgres << EOSQL 2>/dev/null || true
+    psql -v ON_ERROR_STOP=1 -d postgres > /dev/null << EOSQL || err "PostgreSQL root 유저 설정 실패"
 -- root 슈퍼유저
 DO \$\$
 BEGIN
@@ -167,7 +170,7 @@ EOSQL
 fi
 
 if [ -n "$PG_GITLAB_PASS" ]; then
-    psql -d postgres << EOSQL 2>/dev/null || true
+    psql -v ON_ERROR_STOP=1 -d postgres > /dev/null << EOSQL || err "PostgreSQL gitlab 유저 설정 실패"
 -- gitlab 유저
 DO \$\$
 BEGIN
@@ -439,8 +442,9 @@ mkdir -p "$OPENBAO_DATA_DIR" "$OPENBAO_CONFIG_DIR"
 cat > "$OPENBAO_CONFIG_DIR/config.hcl" << EOF
 ui = true
 
+# TLS 없는 리스너이므로 localhost에만 바인딩 (LAN에 시크릿 API·UI를 노출하지 않음)
 listener "tcp" {
-    address     = "0.0.0.0:8200"
+    address     = "127.0.0.1:8200"
     tls_disable = true
 }
 
@@ -459,6 +463,21 @@ mkdir -p "$OPENBAO_DATA_DIR/raft"
 log "OpenBao 설정 생성"
 
 export BAO_ADDR="http://127.0.0.1:8200"
+
+bao_sealed() {
+    curl -sf "$BAO_ADDR/v1/sys/seal-status" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sealed', True))" 2>/dev/null || echo "True"
+}
+
+# 이전 설정(0.0.0.0)으로 실행 중이면 재시작해 localhost 전용 설정 적용 (아래에서 자동 unseal)
+if lsof -nP -iTCP:8200 -sTCP:LISTEN 2>/dev/null | grep -q '\*:8200'; then
+    if [ -f "$OPENBAO_DATA_DIR/init-keys.json" ]; then
+        warn "OpenBao가 모든 인터페이스에 리슨 중 — localhost 전용 설정으로 재시작"
+        pkill -f "bao server" 2>/dev/null || true
+        sleep 2
+    else
+        warn "OpenBao가 모든 인터페이스에 리슨 중 — init-keys.json이 없어 자동 재시작하지 않음 (수동 재시작 + unseal 필요)"
+    fi
+fi
 
 # seal-status는 sealed/unsealed 모두 200 반환
 if curl -sf "$BAO_ADDR/v1/sys/seal-status" &>/dev/null; then
@@ -489,9 +508,9 @@ if [ "$INIT_STATUS" = "True" ]; then
         UNSEAL_KEY=$(python3 -c "import json; print(json.load(open('$OPENBAO_DATA_DIR/init-keys.json'))['unseal_keys_b64'][0])" 2>/dev/null || true)
         ROOT_TOKEN=$(python3 -c "import json; print(json.load(open('$OPENBAO_DATA_DIR/init-keys.json'))['root_token'])" 2>/dev/null || true)
 
-        SEALED=$(curl -sf "$BAO_ADDR/v1/sys/seal-status" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sealed', True))" 2>/dev/null || echo "True")
-        if [ "$SEALED" = "True" ]; then
+        if [ "$(bao_sealed)" = "True" ]; then
             bao operator unseal "$UNSEAL_KEY" > /dev/null 2>&1
+            [ "$(bao_sealed)" = "False" ] || err "OpenBao Unseal 실패 — init-keys.json의 unseal key 확인"
             log "OpenBao Unseal 완료"
         else
             log "OpenBao 이미 Unsealed"
@@ -524,6 +543,7 @@ else
         echo ""
 
         bao operator unseal "$UNSEAL_KEY" > /dev/null 2>&1
+        [ "$(bao_sealed)" = "False" ] || err "OpenBao Unseal 실패 — 위의 Unseal Key로 수동 unseal 필요"
         log "OpenBao Unseal 완료"
     else
         err "OpenBao 초기화 실패:
@@ -536,6 +556,12 @@ if [ -n "${ROOT_TOKEN:-}" ]; then
     export BAO_TOKEN="$ROOT_TOKEN"
 
     bao secrets enable -path=infra kv-v2 2>/dev/null || true
+    bao secrets list -format=json 2>/dev/null \
+        | python3 -c "import sys,json; sys.exit(0 if 'infra/' in json.load(sys.stdin) else 1)" \
+        || err "OpenBao infra/ KV 마운트 확인 실패"
+
+    # 저장 실패를 무시하면 새로 만든 패스워드가 어디에도 남지 않으므로 중단
+    PG_SAVE_ERR="OpenBao infra/postgresql 저장 실패 — PostgreSQL 패스워드는 이미 변경됨. 원인 해결 후 다시 실행해 재생성(Y)을 선택하세요"
 
     # PostgreSQL — 새로 설정한 패스워드만 반영 (나머지 필드는 유지)
     PG_FIELDS=()
@@ -543,12 +569,12 @@ if [ -n "${ROOT_TOKEN:-}" ]; then
     [ -n "$PG_GITLAB_PASS" ] && PG_FIELDS+=(gitlab_user="gitlab" gitlab_password="$PG_GITLAB_PASS")
     if [ "${#PG_FIELDS[@]}" -gt 0 ]; then
         if bao kv get infra/postgresql &>/dev/null; then
-            bao kv patch infra/postgresql "${PG_FIELDS[@]}" 2>/dev/null || true
+            bao kv patch infra/postgresql "${PG_FIELDS[@]}" > /dev/null || err "$PG_SAVE_ERR"
         else
             bao kv put infra/postgresql \
                 host="host.docker.internal" \
                 port="5432" \
-                "${PG_FIELDS[@]}" 2>/dev/null || true
+                "${PG_FIELDS[@]}" > /dev/null || err "$PG_SAVE_ERR"
         fi
         log "시크릿 업데이트: infra/postgresql"
     elif bao kv get infra/postgresql &>/dev/null; then
@@ -565,17 +591,19 @@ if [ -n "${ROOT_TOKEN:-}" ]; then
                 endpoint="http://host.docker.internal:${GARAGE_S3_PORT}" \
                 region="$GARAGE_REGION" \
                 gitlab_access_key="$GARAGE_GITLAB_KEY_ID" \
-                gitlab_secret_key="$GARAGE_GITLAB_SECRET" 2>/dev/null || true
+                gitlab_secret_key="$GARAGE_GITLAB_SECRET" > /dev/null || err "OpenBao infra/garage 저장 실패 — 원인 해결 후 다시 실행하세요"
         fi
         log "시크릿 저장: infra/garage"
     fi
 
     bao kv put infra/valkey \
         host="host.docker.internal" \
-        port="6379" 2>/dev/null || true
+        port="6379" > /dev/null || err "OpenBao infra/valkey 저장 실패"
 
     log "시크릿 저장: infra/valkey"
     unset BAO_TOKEN
+elif [ -n "$PG_ROOT_PASS$PG_GITLAB_PASS" ]; then
+    err "OpenBao 토큰이 없어 새 PostgreSQL 패스워드를 저장할 수 없습니다 — init-keys.json 복구 후 다시 실행해 재생성(Y)을 선택하세요"
 fi
 
 step "6/7 Tailscale TLS 인증서"

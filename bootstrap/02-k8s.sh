@@ -25,6 +25,9 @@ step() { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Apple Silicon Homebrew(/opt/homebrew)는 기본 PATH에 없음 — run.sh나 새 셸에서 실행해도 찾도록
+[ -x /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)"
+
 INSTALL_GITLAB="${INSTALL_GITLAB:-false}"
 
 PG_VERSION="18"

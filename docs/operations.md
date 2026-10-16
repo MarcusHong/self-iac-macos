@@ -7,10 +7,10 @@
 | PostgreSQL | `psql -d postgres` |
 | Valkey | `valkey-cli` |
 | Garage (S3) | http://localhost:3900 (콘솔 없음 — `garage` CLI, 아래 참고) |
-| OpenBao UI | http://localhost:8200/ui |
+| OpenBao UI | http://localhost:8200/ui (서버 localhost 전용 — 랩탑에서는 `ssh -L 8200:127.0.0.1:8200 <server>`) |
 | Argo CD | https://<tailscale-hostname>/argocd |
 | GitLab (선택) | https://<tailscale-hostname> |
-| Registry (GitLab 사용 시) | `kubectl get svc gitlab-registry -n gitlab` (LoadBalancer IP:5000) |
+| Registry (GitLab 사용 시) | `docker login <tailscale-hostname>:5050` (Traefik `registry` 엔트리포인트, TLS) |
 
 ## Garage (오브젝트 스토리지)
 

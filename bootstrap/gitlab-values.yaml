@@ -13,9 +13,14 @@ global:
       name: TS_HOSTNAME_PLACEHOLDER
     # 외부 URL은 HTTPS지만, Ingress 단에서 TLS는 Traefik이 처리
     https: true
+    # Registry는 같은 호스트의 전용 포트(:5050, Traefik registry 엔트리포인트)로 노출
     registry:
       name: TS_HOSTNAME_PLACEHOLDER
       https: true
+
+  # GitLab UI·CI_REGISTRY에 표시되는 외부 포트 (<host>:5050)
+  registry:
+    port: 5050
 
   # 차트 10.x(GitLab 19)부터 기본값이 Gateway API + Envoy Gateway — Traefik Ingress로 되돌림
   gatewayApi:
@@ -208,10 +213,12 @@ registry:
   hpa:
     minReplicas: 1
     maxReplicas: 1
+  # GitLab(websecure)과 같은 호스트이므로 TLS 전용 엔트리포인트(:5050)에만 라우팅
   ingress:
-    enabled: false
-  service:
-    type: LoadBalancer
+    enabled: true
+    annotations:
+      traefik.ingress.kubernetes.io/router.entrypoints: registry
+      traefik.ingress.kubernetes.io/router.tls: "true"
   storage:
     secret: gitlab-registry-storage
     key: config

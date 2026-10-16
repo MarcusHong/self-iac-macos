@@ -39,9 +39,9 @@ headless 서버로 운영하기 위한 macOS 설정. 스크립트가 자동 수�
 스크립트가 순서대로 설치하고 상태를 확인한다.
 
 1. Xcode Command Line Tools (Git 포함)
-2. Homebrew
+2. Homebrew (Apple Silicon은 `~/.zprofile`에 `brew shellenv` 등록)
 3. OrbStack (K8s 활성화 + `k8s.expose_services` 활성화 후 재시작)
-4. Tailscale (로그인)
+4. Tailscale (`brew install tailscale` 후 `sudo brew services start tailscale`로 tailscaled 시작, 로그인)
 
 `k8s.expose_services`가 꺼져 있으면 K8s API(:26443)와 LoadBalancer 서비스가 localhost에만 바인딩되어
 Tailscale 경유 접근(`client.sh`, `https://<hostname>.ts.net`)이 불가능하다.

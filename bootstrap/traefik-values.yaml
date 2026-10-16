@@ -7,9 +7,11 @@ service:
   spec:
     type: LoadBalancer
 
-# 컨테이너는 non-root(8000/8443)로 리슨하고 Service에서 80/443으로 노출
+# 컨테이너는 non-root(8000/8443/5050)로 리슨하고 Service에서 80/443/5050으로 노출
+# web/websecure를 기본 엔트리포인트로 지정 — entrypoints 어노테이션이 없는 Ingress는 여기에만 붙음
 ports:
   web:
+    asDefault: true
     exposedPort: 80
     # HTTP→HTTPS 리다이렉트
     http:
@@ -19,7 +21,18 @@ ports:
           scheme: https
           permanent: true
   websecure:
+    asDefault: true
     exposedPort: 443
+  # GitLab Container Registry 전용 (GitLab과 같은 Tailscale 호스트, macOS AirPlay가 쓰는 5000은 피함)
+  registry:
+    port: 5050
+    exposedPort: 5050
+    expose:
+      default: true
+    protocol: TCP
+    http:
+      tls:
+        enabled: true
 
 tlsStore:
   default:

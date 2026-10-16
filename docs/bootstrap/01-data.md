@@ -155,6 +155,19 @@ Homebrew 설치가 실패하면 GitHub 릴리스의 `openbao_<버전>_darwin_<ar
 
 **UI 접속:** http://localhost:8200/ui (Root Token으로 로그인)
 
+OpenBao는 TLS 없이 동작하므로 `127.0.0.1:8200`에만 바인딩한다. 랩탑에서는 SSH 터널로 접속한다.
+
+```bash
+ssh -L 8200:127.0.0.1:8200 <user>@<server>
+# → http://localhost:8200/ui
+```
+
+이전 버전(0.0.0.0 바인딩)으로 실행 중이면 `01-data.sh`가 재시작 후 `init-keys.json`으로 자동 unseal한다.
+
+**저장 실패 처리:** unseal 실패, `infra/` KV 마운트 누락, 시크릿 저장 실패 시 스크립트가 중단된다.
+PostgreSQL 패스워드는 OpenBao 저장보다 먼저 적용되므로, 저장 단계에서 중단되면 원인을 해결한 뒤
+다시 실행해 패스워드 재생성(Y)을 선택한다.
+
 **CLI 사용:**
 
 ```bash
