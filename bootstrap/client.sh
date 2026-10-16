@@ -38,35 +38,71 @@ log "SSH 연결 OK"
 # ── 2. kubeconfig 구성 ──
 step "kubeconfig 구성"
 
-# 기존 orbstack context 제거 (재등록 대응)
-kubectl config delete-context orbstack 2>/dev/null || true
-kubectl config delete-cluster orbstack 2>/dev/null || true
-kubectl config delete-user orbstack 2>/dev/null || true
+# 로컬 OrbStack이 관리하는 orbstack 항목과 겹치지 않도록 원격은 별도 이름으로 등록
+REMOTE_NAME="orbstack-remote"
+REMOTE_SERVER="https://${ORBSTACK_HOST}:26443"
+REMOTE_CONFIG=~/.kube/orbstack-remote-config
 
-scp "$ORBSTACK_SSH":~/.kube/config ~/.kube/orbstack-config || err "kubeconfig 복사 실패"
+mkdir -p ~/.kube && chmod 700 ~/.kube
+
+# 재등록 대응: 이전에 등록한 원격 항목 제거
+kubectl config delete-context "$REMOTE_NAME" &>/dev/null || true
+kubectl config delete-cluster "$REMOTE_NAME" &>/dev/null || true
+kubectl config delete-user "$REMOTE_NAME" &>/dev/null || true
+
+# 이전 버전은 원격을 orbstack 이름으로 등록했음 — 같은 서버를 가리킬 때만 제거 (로컬 OrbStack 항목은 유지)
+OLD_SERVER=$(kubectl config view -o jsonpath='{.clusters[?(@.name=="orbstack")].cluster.server}' 2>/dev/null || true)
+SWITCH_CONTEXT=false
+if [ "$OLD_SERVER" = "$REMOTE_SERVER" ]; then
+    [ "$(kubectl config current-context 2>/dev/null)" = "orbstack" ] && SWITCH_CONTEXT=true
+    kubectl config delete-context orbstack &>/dev/null || true
+    kubectl config delete-cluster orbstack &>/dev/null || true
+    kubectl config delete-user orbstack &>/dev/null || true
+    warn "이전 버전이 orbstack 이름으로 등록한 원격 항목 제거"
+fi
+
+(umask 077; scp "$ORBSTACK_SSH":~/.kube/config "$REMOTE_CONFIG") || err "kubeconfig 복사 실패"
 log "kubeconfig 복사 완료"
 
-# 원격 kubeconfig에서 orbstack context만 추출 (다른 context가 로컬을 덮어쓰지 않도록)
-KUBECONFIG=~/.kube/orbstack-config kubectl config get-contexts -o name | while read -r ctx; do
-    [ "$ctx" = "orbstack" ] || KUBECONFIG=~/.kube/orbstack-config kubectl config delete-context "$ctx" 2>/dev/null || true
-done
-
+# 원격 kubeconfig에서 orbstack context와 그 cluster/user만 남기고 orbstack-remote로 이름 변경
 # OrbStack은 localhost용 인증서만 발급하므로 Tailscale 경유 시 TLS 검증 우회 필요
-sed -i '' '/certificate-authority-data:/d' ~/.kube/orbstack-config
-# server 주소 변경 + insecure-skip-tls-verify 추가
-KUBECONFIG=~/.kube/orbstack-config kubectl config set-cluster orbstack \
-    --server="https://${ORBSTACK_HOST}:26443" \
-    --insecure-skip-tls-verify=true || err "kubeconfig 수정 실패"
-log "server → https://${ORBSTACK_HOST}:26443"
+RENDERED=$(KUBECONFIG="$REMOTE_CONFIG" kubectl config view --raw -o json | python3 -c '
+import json, sys
+name, server = sys.argv[1], sys.argv[2]
+c = json.load(sys.stdin)
+ctx = next(x for x in c["contexts"] if x["name"] == "orbstack")
+cl = next(x for x in c["clusters"] if x["name"] == ctx["context"]["cluster"])
+us = next(x for x in c["users"] if x["name"] == ctx["context"]["user"])
+cl["cluster"].pop("certificate-authority-data", None)
+cl["cluster"]["server"] = server
+cl["cluster"]["insecure-skip-tls-verify"] = True
+cl["name"] = us["name"] = ctx["name"] = name
+ctx["context"]["cluster"] = ctx["context"]["user"] = name
+c.update(clusters=[cl], users=[us], contexts=[ctx])
+c["current-context"] = name
+json.dump(c, sys.stdout)
+' "$REMOTE_NAME" "$REMOTE_SERVER") || { rm -f "$REMOTE_CONFIG"; err "원격 kubeconfig에 orbstack context가 없습니다"; }
+(umask 077; printf '%s\n' "$RENDERED" > "$REMOTE_CONFIG")
+log "context ${REMOTE_NAME} → ${REMOTE_SERVER}"
 
-# 기존 config 백업 후 merge
-cp ~/.kube/config ~/.kube/config.bak
-KUBECONFIG=~/.kube/config:~/.kube/orbstack-config \
-  kubectl config view --flatten > ~/.kube/config-merged || { mv ~/.kube/config.bak ~/.kube/config; err "kubeconfig merge 실패"; }
+# 기존 config 백업 후 merge (기존 current-context 유지)
+BACKUP_MSG="기존 config 없음"
+if [ -f ~/.kube/config ]; then
+    cp -p ~/.kube/config ~/.kube/config.bak
+    BACKUP_MSG="백업: ~/.kube/config.bak"
+fi
+(umask 077; KUBECONFIG=~/.kube/config:"$REMOTE_CONFIG" kubectl config view --flatten > ~/.kube/config-merged) \
+    || { rm -f ~/.kube/config-merged "$REMOTE_CONFIG"; err "kubeconfig merge 실패 (기존 ~/.kube/config는 그대로)"; }
 mv ~/.kube/config-merged ~/.kube/config
-rm -f ~/.kube/orbstack-config
-log "kubeconfig merge 완료 (백업: ~/.kube/config.bak)"
+rm -f "$REMOTE_CONFIG"
+log "kubeconfig merge 완료 (${BACKUP_MSG})"
 
-kubectl --context=orbstack cluster-info &>/dev/null || err "원격 OrbStack 연결 실패"
-log "원격 OrbStack K8s 연결 성공"
-kubectl --context=orbstack get nodes
+# 이전 버전의 orbstack(원격)이 current-context였다면 새 이름으로 전환
+if [ "$SWITCH_CONTEXT" = "true" ]; then
+    kubectl config use-context "$REMOTE_NAME" > /dev/null
+    log "current-context → ${REMOTE_NAME}"
+fi
+
+kubectl --context="$REMOTE_NAME" cluster-info &>/dev/null || err "원격 OrbStack 연결 실패"
+log "원격 OrbStack K8s 연결 성공 — kubectl --context=${REMOTE_NAME}"
+kubectl --context="$REMOTE_NAME" get nodes

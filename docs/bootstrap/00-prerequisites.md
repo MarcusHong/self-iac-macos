@@ -71,9 +71,19 @@ Tailscale 경유 접근(`client.sh`, `https://<hostname>.ts.net`)이 불가능�
 ### 자동 수행 내용
 
 1. kubeconfig 복사 (`scp`)
-2. server 주소를 Tailscale MagicDNS hostname으로 변경
-3. `insecure-skip-tls-verify` 설정
-4. kubeconfig merge
+2. 원격 `orbstack` context/cluster/user만 남기고 이름을 `orbstack-remote`로 변경
+3. server 주소를 Tailscale MagicDNS hostname으로 변경
+4. `insecure-skip-tls-verify` 설정
+5. kubeconfig merge (기존 current-context 유지, 파일 권한 0600)
+
+```bash
+kubectl --context=orbstack-remote get nodes
+kubectl config use-context orbstack-remote   # 기본 context로 쓰려면
+```
+
+랩탑에도 OrbStack이 있으면 OrbStack이 `orbstack` 항목을 직접 관리하므로, 원격은 `orbstack-remote`로 등록해
+서로 덮어쓰지 않게 한다. 이전 버전 `client.sh`가 원격을 `orbstack` 이름으로 등록해 두었다면,
+같은 서버 주소를 가리킬 때만 그 항목을 제거한다.
 
 `k8s.expose_services`는 서버의 `00-prerequisites.sh`에서 활성화된다.
 
