@@ -11,6 +11,9 @@ set -uo pipefail
 #   ⑤ OpenBao
 #   ⑥ Tailscale TLS 인증서
 #   ⑦ 인증서 갱신 cron
+#
+# INSTALL_GITLAB=true 일 때만 GitLab용 리소스(PG gitlab 유저/DB,
+# MinIO gitlab-* 버킷)를 만든다. 기본값: false
 # ================================================
 
 GREEN='\033[0;32m'
@@ -25,7 +28,9 @@ err()  { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 step() { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 
 # ── 설정 ──
+INSTALL_GITLAB="${INSTALL_GITLAB:-false}"
 PG_VERSION="18"
+OPENBAO_VERSION="2.7.1"   # brew 설치 실패 시 바이너리 다운로드 버전
 MINIO_ROOT_USER="minioadmin"
 MINIO_ROOT_PASS=""
 MINIO_DATA_DIR="$HOME/.local/share/minio"
@@ -34,6 +39,8 @@ MINIO_ENV_FILE="$MINIO_CONFIG_DIR/env"
 OPENBAO_DATA_DIR="$HOME/.local/share/openbao"
 OPENBAO_CONFIG_DIR="$HOME/.config/openbao"
 CERT_DIR="$HOME/.local/share/tailscale-certs"
+
+gen_pass() { openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32; }
 
 # MinIO는 기동할 때마다 같은 root 자격증명이 필요하므로 파일(0600)에 보관
 write_minio_env() {
@@ -53,6 +60,12 @@ log "Helm OK"
 
 command -v flux &>/dev/null || { echo "  flux CLI 설치 중..."; brew install fluxcd/tap/flux; }
 log "flux CLI OK"
+
+if [ "$INSTALL_GITLAB" = "true" ]; then
+    log "GitLab 리소스 포함 (INSTALL_GITLAB=true)"
+else
+    log "GitLab 리소스 건너뜀 (INSTALL_GITLAB=${INSTALL_GITLAB})"
+fi
 
 if ! command -v tailscale &>/dev/null; then
     err "Tailscale 필요: https://tailscale.com/download/mac"
@@ -106,14 +119,15 @@ if ! psql -d postgres -c "SELECT version();" &>/dev/null; then
 fi
 log "PostgreSQL 실행 중 — $(psql -d postgres -tAc 'SHOW server_version;')"
 
-PG_USERS_EXIST=false
 PG_RESET_PASSWORDS=false
 
 ROOT_EXISTS=$(psql -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='root';" 2>/dev/null || echo "")
-GITLAB_EXISTS=$(psql -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='gitlab';" 2>/dev/null || echo "")
+GITLAB_EXISTS=""
+if [ "$INSTALL_GITLAB" = "true" ]; then
+    GITLAB_EXISTS=$(psql -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='gitlab';" 2>/dev/null || echo "")
+fi
 
 if [ "$ROOT_EXISTS" = "1" ] || [ "$GITLAB_EXISTS" = "1" ]; then
-    PG_USERS_EXIST=true
     echo ""
     warn "PostgreSQL 유저가 이미 존재합니다:"
     [ "$ROOT_EXISTS" = "1" ] && echo "    - root (superuser)"
@@ -129,10 +143,18 @@ if [ "$ROOT_EXISTS" = "1" ] || [ "$GITLAB_EXISTS" = "1" ]; then
     esac
 fi
 
-if [ "$PG_USERS_EXIST" = "false" ] || [ "$PG_RESET_PASSWORDS" = "true" ]; then
-    PG_ROOT_PASS=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32)
-    PG_GITLAB_PASS=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32)
+# 없는 유저는 새로 만들고, 재생성을 선택하면 기존 유저 패스워드도 교체
+# (나중에 INSTALL_GITLAB=true로 재실행하면 gitlab 유저만 추가로 생성됨)
+PG_ROOT_PASS=""
+PG_GITLAB_PASS=""
+if [ "$ROOT_EXISTS" != "1" ] || [ "$PG_RESET_PASSWORDS" = "true" ]; then
+    PG_ROOT_PASS=$(gen_pass)
+fi
+if [ "$INSTALL_GITLAB" = "true" ] && { [ "$GITLAB_EXISTS" != "1" ] || [ "$PG_RESET_PASSWORDS" = "true" ]; }; then
+    PG_GITLAB_PASS=$(gen_pass)
+fi
 
+if [ -n "$PG_ROOT_PASS" ]; then
     psql -d postgres << EOSQL 2>/dev/null || true
 -- root 슈퍼유저
 DO \$\$
@@ -144,7 +166,12 @@ BEGIN
     END IF;
 END
 \$\$;
+EOSQL
+    log "유저 패스워드 설정: root (superuser) — OpenBao 업데이트 예정"
+fi
 
+if [ -n "$PG_GITLAB_PASS" ]; then
+    psql -d postgres << EOSQL 2>/dev/null || true
 -- gitlab 유저
 DO \$\$
 BEGIN
@@ -156,21 +183,11 @@ BEGIN
 END
 \$\$;
 EOSQL
-
-    if [ "$PG_RESET_PASSWORDS" = "true" ]; then
-        log "패스워드 재생성 완료 — OpenBao 업데이트 예정"
-        PG_UPDATE_OPENBAO=true
-    else
-        log "유저 생성: root (superuser), gitlab"
-        PG_UPDATE_OPENBAO=true
-    fi
-else
-    PG_ROOT_PASS=""
-    PG_GITLAB_PASS=""
-    PG_UPDATE_OPENBAO=false
+    log "유저 패스워드 설정: gitlab — OpenBao 업데이트 예정"
 fi
 
-psql -d postgres << EOSQL 2>/dev/null || true
+if [ "$INSTALL_GITLAB" = "true" ]; then
+    psql -d postgres << EOSQL 2>/dev/null || true
 SELECT 'CREATE DATABASE gitlab OWNER gitlab'
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'gitlab');
 \gexec
@@ -180,7 +197,8 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 GRANT ALL PRIVILEGES ON DATABASE gitlab TO gitlab;
 EOSQL
-log "gitlab DB + 확장 모듈 준비 (owner: gitlab)"
+    log "gitlab DB + 확장 모듈 준비 (owner: gitlab)"
+fi
 
 PG_DATA_DIR="$(brew --prefix)/var/postgresql@${PG_VERSION}"
 
@@ -287,7 +305,7 @@ else
         if [ -d "$MINIO_DATA_DIR/.minio.sys" ]; then
             warn "기존 MinIO 데이터가 있지만 자격증명 파일이 없음 — 새 패스워드로 기동 (완료 후 02-k8s.sh 재실행 필요)"
         fi
-        MINIO_ROOT_PASS=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32)
+        MINIO_ROOT_PASS=$(gen_pass)
         write_minio_env
         log "MinIO 자격증명 생성 — ${MINIO_ENV_FILE}"
     fi
@@ -302,8 +320,11 @@ else
     log "MinIO 시작됨 — localhost:9000 (콘솔: 9001)"
 fi
 
-# 버킷 생성은 비밀번호를 알 때만 (자격증명 파일이 없는 이전 설치는 OpenBao 단계에서 파일을 복원)
-if [ -n "$MINIO_ROOT_PASS" ]; then
+# GitLab 버킷은 INSTALL_GITLAB=true 이고 비밀번호를 알 때만 생성
+# (자격증명 파일이 없는 이전 설치는 OpenBao 단계에서 파일을 복원)
+if [ "$INSTALL_GITLAB" != "true" ]; then
+    log "GitLab 버킷 건너뜀 (INSTALL_GITLAB=${INSTALL_GITLAB})"
+elif [ -n "$MINIO_ROOT_PASS" ]; then
     mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASS" 2>/dev/null || true
     for bucket in gitlab-artifacts gitlab-uploads gitlab-packages gitlab-registry gitlab-lfs gitlab-terraform gitlab-backups gitlab-runner-cache; do
         mc mb "local/${bucket}" 2>/dev/null || true
@@ -321,12 +342,13 @@ if ! command -v bao &>/dev/null; then
         # Homebrew에 없으면 바이너리 직접 다운로드
         warn "brew 설치 실패, 바이너리 다운로드 시도..."
         ARCH=$(uname -m)
-        [ "$ARCH" = "arm64" ] && ARCH="arm64" || ARCH="amd64"
-        curl -fsSL "https://github.com/openbao/openbao/releases/download/v2.5.1/bao_2.5.1_darwin_${ARCH}.zip" -o /tmp/bao.zip
-        unzip -o /tmp/bao.zip -d /tmp/bao
-        sudo mv /tmp/bao/bao /usr/local/bin/bao
+        [ "$ARCH" = "arm64" ] || ARCH="amd64"
+        BAO_TMP=$(mktemp -d)
+        curl -fsSL "https://github.com/openbao/openbao/releases/download/v${OPENBAO_VERSION}/openbao_${OPENBAO_VERSION}_darwin_${ARCH}.tar.gz" -o "$BAO_TMP/openbao.tar.gz"
+        tar -xzf "$BAO_TMP/openbao.tar.gz" -C "$BAO_TMP" bao
+        sudo mv "$BAO_TMP/bao" /usr/local/bin/bao
         sudo chmod +x /usr/local/bin/bao
-        rm -rf /tmp/bao /tmp/bao.zip
+        rm -rf "$BAO_TMP"
     }
 fi
 
@@ -463,23 +485,25 @@ if [ -n "${ROOT_TOKEN:-}" ]; then
 
     bao secrets enable -path=infra kv-v2 2>/dev/null || true
 
-    # PostgreSQL — 새 패스워드가 있을 때만 업데이트
-    if [ "${PG_UPDATE_OPENBAO:-false}" = "true" ] && [ -n "$PG_ROOT_PASS" ]; then
-        bao kv put infra/postgresql \
-            host="host.docker.internal" \
-            port="5432" \
-            root_user="root" \
-            root_password="$PG_ROOT_PASS" \
-            gitlab_user="gitlab" \
-            gitlab_password="$PG_GITLAB_PASS" 2>/dev/null || true
-        log "시크릿 업데이트: infra/postgresql"
-    else
+    # PostgreSQL — 새로 설정한 패스워드만 반영 (나머지 필드는 유지)
+    PG_FIELDS=()
+    [ -n "$PG_ROOT_PASS" ] && PG_FIELDS+=(root_user="root" root_password="$PG_ROOT_PASS")
+    [ -n "$PG_GITLAB_PASS" ] && PG_FIELDS+=(gitlab_user="gitlab" gitlab_password="$PG_GITLAB_PASS")
+    if [ "${#PG_FIELDS[@]}" -gt 0 ]; then
         if bao kv get infra/postgresql &>/dev/null; then
-            log "시크릿 유지: infra/postgresql (변경 없음)"
+            bao kv patch infra/postgresql "${PG_FIELDS[@]}" 2>/dev/null || true
         else
-            warn "infra/postgresql 시크릿 없음 — 패스워드 재생성이 필요합니다"
-            echo "  스크립트를 다시 실행하고 패스워드 재생성에 Y를 선택하세요."
+            bao kv put infra/postgresql \
+                host="host.docker.internal" \
+                port="5432" \
+                "${PG_FIELDS[@]}" 2>/dev/null || true
         fi
+        log "시크릿 업데이트: infra/postgresql"
+    elif bao kv get infra/postgresql &>/dev/null; then
+        log "시크릿 유지: infra/postgresql (변경 없음)"
+    else
+        warn "infra/postgresql 시크릿 없음 — 패스워드 재생성이 필요합니다"
+        echo "  스크립트를 다시 실행하고 패스워드 재생성에 Y를 선택하세요."
     fi
 
     if [ -n "$MINIO_ROOT_PASS" ]; then

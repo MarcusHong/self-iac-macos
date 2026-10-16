@@ -5,10 +5,11 @@ set -uo pipefail
 # K8s 워크로드 (02-k8s)
 #
 #   ① Traefik (TLS 종단)
-#   ② GitLab CE (Helm)
-#   ③ Flux 부트스트랩
+#   ② GitLab CE (Helm, INSTALL_GITLAB=true 일 때만)
+#   ③ Flux 부트스트랩 (GitLab을 소스로 쓰므로 INSTALL_GITLAB=true 일 때만)
 #
 # 01-data.sh가 실행 중이어야 함
+# INSTALL_GITLAB 기본값: false (01-data.sh와 같은 값으로 실행)
 # ================================================
 
 GREEN='\033[0;32m'
@@ -24,9 +25,15 @@ step() { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+INSTALL_GITLAB="${INSTALL_GITLAB:-false}"
+
 PG_VERSION="18"
 CERT_DIR="$HOME/.local/share/tailscale-certs"
 OPENBAO_DATA_DIR="$HOME/.local/share/openbao"
+
+# Helm 차트 버전 (고정)
+TRAEFIK_CHART_VERSION="42.0.0"   # Traefik v3.7.14
+GITLAB_CHART_VERSION="10.5.0"    # GitLab 19.5.0
 
 FLUX_OWNER="infra"
 FLUX_REPO="infra"
@@ -35,21 +42,26 @@ FLUX_PATH="clusters/mac-mini"
 
 step "1/4 사전 체크"
 
-for cmd in kubectl helm flux; do
+for cmd in kubectl helm; do
     command -v "$cmd" &>/dev/null || err "$cmd 필요"
 done
+if [ "$INSTALL_GITLAB" = "true" ]; then
+    command -v flux &>/dev/null || err "flux 필요"
+fi
 
 if ! kubectl cluster-info &>/dev/null; then
     err "K8s 클러스터 연결 실패 (OrbStack K8s 활성화 확인)"
 fi
 log "K8s OK"
 
-# postgresql@18은 keg-only라 brew bin에 링크되지 않음 (01-data.sh의 PATH 설정은 이 프로세스에 전달되지 않음)
-export PATH="$(brew --prefix postgresql@${PG_VERSION})/bin:$PATH"
+if [ "$INSTALL_GITLAB" = "true" ]; then
+    # postgresql@18은 keg-only라 brew bin에 링크되지 않음 (01-data.sh의 PATH 설정은 이 프로세스에 전달되지 않음)
+    export PATH="$(brew --prefix postgresql@${PG_VERSION})/bin:$PATH"
 
-psql -d postgres -c "SELECT 1;" &>/dev/null || err "PostgreSQL 미실행 (01-data.sh 먼저)"
-valkey-cli ping 2>/dev/null | grep -q "PONG" || err "Valkey 미실행"
-curl -sf http://localhost:9000/minio/health/live &>/dev/null || err "MinIO 미실행"
+    psql -d postgres -c "SELECT 1;" &>/dev/null || err "PostgreSQL 미실행 (01-data.sh 먼저)"
+    valkey-cli ping 2>/dev/null | grep -q "PONG" || err "Valkey 미실행"
+    curl -sf http://localhost:9000/minio/health/live &>/dev/null || err "MinIO 미실행"
+fi
 curl -sf http://127.0.0.1:8200/v1/sys/seal-status &>/dev/null || err "OpenBao 미실행"
 log "호스트 데이터 레이어 OK"
 
@@ -74,19 +86,18 @@ if [ -f "$OPENBAO_DATA_DIR/init-keys.json" ]; then
     ROOT_TOKEN=$(python3 -c "import json; print(json.load(open('$OPENBAO_DATA_DIR/init-keys.json'))['root_token'])" 2>/dev/null || true)
     export BAO_TOKEN="${ROOT_TOKEN:-}"
 fi
+[ -n "${BAO_TOKEN:-}" ] || err "OpenBao 토큰 없음 — 01-data.sh를 먼저 실행하세요"
 
 MINIO_USER=""
 MINIO_PASS=""
 PG_GITLAB_PASS=""
-if [ -n "${BAO_TOKEN:-}" ]; then
+if [ "$INSTALL_GITLAB" = "true" ]; then
     MINIO_USER=$(bao kv get -field=root_user infra/minio 2>/dev/null || echo "minioadmin")
     MINIO_PASS=$(bao kv get -field=root_password infra/minio 2>/dev/null || echo "")
     PG_GITLAB_PASS=$(bao kv get -field=gitlab_password infra/postgresql 2>/dev/null || echo "")
     [ -n "$MINIO_PASS" ] || err "OpenBao에 infra/minio 시크릿 없음 — 01-data.sh를 먼저 실행하세요"
-    [ -n "$PG_GITLAB_PASS" ] || err "OpenBao에 infra/postgresql 시크릿 없음 — 01-data.sh를 먼저 실행하세요"
+    [ -n "$PG_GITLAB_PASS" ] || err "OpenBao에 infra/postgresql gitlab 패스워드 없음 — INSTALL_GITLAB=true ./bootstrap/01-data.sh 먼저"
     log "OpenBao에서 시크릿 로드 (minio, postgresql)"
-else
-    err "OpenBao 토큰 없음 — 01-data.sh를 먼저 실행하세요"
 fi
 
 step "2/4 Traefik"
@@ -101,6 +112,7 @@ kubectl create secret tls tailscale-tls \
 log "TLS Secret 등록"
 
 helm upgrade --install traefik oci://ghcr.io/traefik/helm/traefik \
+    --version "$TRAEFIK_CHART_VERSION" \
     --namespace traefik \
     -f "$SCRIPT_DIR/traefik-values.yaml" \
     --wait --timeout 3m || err "Traefik 설치 실패"
@@ -109,16 +121,19 @@ log "Traefik 완료 (HTTPS: 443)"
 
 step "3/4 GitLab CE"
 
-kubectl create namespace gitlab 2>/dev/null || true
+if [ "$INSTALL_GITLAB" != "true" ]; then
+    log "건너뜀 (INSTALL_GITLAB=${INSTALL_GITLAB}) — 설치하려면 INSTALL_GITLAB=true로 01, 02 재실행"
+else
+    kubectl create namespace gitlab 2>/dev/null || true
 
-kubectl create secret generic gitlab-postgres-secret \
-    --namespace gitlab \
-    --from-literal=password="${PG_GITLAB_PASS}" \
-    --dry-run=client -o yaml | kubectl apply -f -
+    kubectl create secret generic gitlab-postgres-secret \
+        --namespace gitlab \
+        --from-literal=password="${PG_GITLAB_PASS}" \
+        --dry-run=client -o yaml | kubectl apply -f -
 
-kubectl create secret generic gitlab-minio-secret \
-    --namespace gitlab \
-    --from-literal=connection="$(cat << EOF
+    kubectl create secret generic gitlab-minio-secret \
+        --namespace gitlab \
+        --from-literal=connection="$(cat << EOF
 provider: AWS
 endpoint: http://host.docker.internal:9000
 aws_access_key_id: ${MINIO_USER}
@@ -127,11 +142,11 @@ region: us-east-1
 path_style: true
 EOF
 )" \
-    --dry-run=client -o yaml | kubectl apply -f -
+        --dry-run=client -o yaml | kubectl apply -f -
 
-kubectl create secret generic gitlab-registry-storage \
-    --namespace gitlab \
-    --from-literal=config="$(cat << EOF
+    kubectl create secret generic gitlab-registry-storage \
+        --namespace gitlab \
+        --from-literal=config="$(cat << EOF
 s3:
   bucket: gitlab-registry
   accesskey: ${MINIO_USER}
@@ -141,127 +156,131 @@ s3:
   v4auth: true
 EOF
 )" \
-    --dry-run=client -o yaml | kubectl apply -f -
-
-# ── SMTP 설정 ──
-if [ -z "${SMTP_USER:-}" ]; then
-    echo ""
-    read -rp "  Gmail SMTP 설정? (y/N): " SMTP_ENABLE
-    if [[ "${SMTP_ENABLE:-N}" =~ ^[Yy]$ ]]; then
-        echo "  앱 비밀번호: https://myaccount.google.com/apppasswords"
-        read -rp "  Gmail 주소: " SMTP_USER
-        read -rsp "  앱 비밀번호: " SMTP_PASSWORD
-        echo ""
-    fi
-fi
-
-if [ -n "${SMTP_USER:-}" ] && [ -n "${SMTP_PASSWORD:-}" ]; then
-    kubectl create secret generic gitlab-smtp-secret \
-        --namespace gitlab \
-        --from-literal=password="${SMTP_PASSWORD}" \
         --dry-run=client -o yaml | kubectl apply -f -
-    log "SMTP 시크릿 생성 (${SMTP_USER})"
-else
-    SMTP_USER=""
-    log "SMTP 비활성화"
-fi
 
-# ── Runner 캐시 시크릿 ──
-kubectl create secret generic gitlab-runner-cache-secret \
-    --namespace gitlab \
-    --from-literal=accesskey="${MINIO_USER}" \
-    --from-literal=secretkey="${MINIO_PASS}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-log "Runner 캐시 시크릿 생성"
+    # ── SMTP 설정 ──
+    if [ -z "${SMTP_USER:-}" ]; then
+        echo ""
+        read -rp "  Gmail SMTP 설정? (y/N): " SMTP_ENABLE
+        if [[ "${SMTP_ENABLE:-N}" =~ ^[Yy]$ ]]; then
+            echo "  앱 비밀번호: https://myaccount.google.com/apppasswords"
+            read -rp "  Gmail 주소: " SMTP_USER
+            read -rsp "  앱 비밀번호: " SMTP_PASSWORD
+            echo ""
+        fi
+    fi
 
-log "GitLab K8s Secrets 생성 (PostgreSQL gitlab 유저 패스워드 포함)"
+    if [ -n "${SMTP_USER:-}" ] && [ -n "${SMTP_PASSWORD:-}" ]; then
+        kubectl create secret generic gitlab-smtp-secret \
+            --namespace gitlab \
+            --from-literal=password="${SMTP_PASSWORD}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+        log "SMTP 시크릿 생성 (${SMTP_USER})"
+    else
+        SMTP_USER=""
+        log "SMTP 비활성화"
+    fi
 
-cp "$SCRIPT_DIR/gitlab-values.yaml" /tmp/gitlab-values-rendered.yaml || err "gitlab-values.yaml 복사 실패"
-sed -i '' "s|TS_HOSTNAME_PLACEHOLDER|${TS_HOSTNAME}|g" /tmp/gitlab-values-rendered.yaml
-if [ -n "${SMTP_USER:-}" ]; then
-    sed -i '' "s/SMTP_USER_PLACEHOLDER/${SMTP_USER}/g" /tmp/gitlab-values-rendered.yaml
-    sed -i '' "s/SMTP_ENABLED_PLACEHOLDER/true/" /tmp/gitlab-values-rendered.yaml
-else
-    sed -i '' "s/SMTP_ENABLED_PLACEHOLDER/false/" /tmp/gitlab-values-rendered.yaml
-    sed -i '' "s/SMTP_USER_PLACEHOLDER/noreply@example.com/g" /tmp/gitlab-values-rendered.yaml
-fi
+    # ── Runner 캐시 시크릿 ──
+    kubectl create secret generic gitlab-runner-cache-secret \
+        --namespace gitlab \
+        --from-literal=accesskey="${MINIO_USER}" \
+        --from-literal=secretkey="${MINIO_PASS}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    log "Runner 캐시 시크릿 생성"
 
-helm repo add gitlab https://charts.gitlab.io/ 2>/dev/null || true
-helm repo update gitlab
+    log "GitLab K8s Secrets 생성 (PostgreSQL gitlab 유저 패스워드 포함)"
 
-echo "  GitLab Helm 설치 중 (5~10분)..."
+    cp "$SCRIPT_DIR/gitlab-values.yaml" /tmp/gitlab-values-rendered.yaml || err "gitlab-values.yaml 복사 실패"
+    sed -i '' "s|TS_HOSTNAME_PLACEHOLDER|${TS_HOSTNAME}|g" /tmp/gitlab-values-rendered.yaml
+    if [ -n "${SMTP_USER:-}" ]; then
+        sed -i '' "s/SMTP_USER_PLACEHOLDER/${SMTP_USER}/g" /tmp/gitlab-values-rendered.yaml
+        sed -i '' "s/SMTP_ENABLED_PLACEHOLDER/true/" /tmp/gitlab-values-rendered.yaml
+    else
+        sed -i '' "s/SMTP_ENABLED_PLACEHOLDER/false/" /tmp/gitlab-values-rendered.yaml
+        sed -i '' "s/SMTP_USER_PLACEHOLDER/noreply@example.com/g" /tmp/gitlab-values-rendered.yaml
+    fi
 
-helm upgrade --install gitlab gitlab/gitlab \
-    --namespace gitlab \
-    -f /tmp/gitlab-values-rendered.yaml \
-    --timeout 15m \
-    --wait || err "GitLab 설치 실패"
+    helm repo add gitlab https://charts.gitlab.io/ 2>/dev/null || true
+    helm repo update gitlab
 
-rm -f /tmp/gitlab-values-rendered.yaml
-log "GitLab 설치 완료!"
+    echo "  GitLab Helm 설치 중 (5~10분)..."
 
-GITLAB_ROOT_PW=$(kubectl get secret gitlab-gitlab-initial-root-password \
-    -n gitlab -ojsonpath='{.data.password}' 2>/dev/null | base64 --decode || echo "N/A")
+    helm upgrade --install gitlab gitlab/gitlab \
+        --version "$GITLAB_CHART_VERSION" \
+        --namespace gitlab \
+        -f /tmp/gitlab-values-rendered.yaml \
+        --timeout 15m \
+        --wait || err "GitLab 설치 실패"
 
-echo ""
-echo "  GitLab root 비밀번호: ${GITLAB_ROOT_PW}"
-echo ""
+    rm -f /tmp/gitlab-values-rendered.yaml
+    log "GitLab 설치 완료!"
 
-if [ -n "${BAO_TOKEN:-}" ]; then
+    GITLAB_ROOT_PW=$(kubectl get secret gitlab-gitlab-initial-root-password \
+        -n gitlab -ojsonpath='{.data.password}' 2>/dev/null | base64 --decode || echo "N/A")
+
+    echo ""
+    echo "  GitLab root 비밀번호: ${GITLAB_ROOT_PW}"
+    echo ""
+
     bao kv put infra/gitlab root_password="$GITLAB_ROOT_PW" 2>/dev/null || true
     log "GitLab 비밀번호 → OpenBao 저장"
-fi
 
-echo -n "  GitLab 응답 대기"
-for i in $(seq 1 60); do
-    if curl -sfk "https://${GITLAB_HOST}/-/readiness" > /dev/null 2>&1; then
-        echo ""
-        log "GitLab 응답 OK"
-        break
-    fi
-    echo -n "."
-    sleep 5
-    [ "$i" -eq 60 ] && { echo ""; warn "기동 중. kubectl get pods -n gitlab"; }
-done
+    echo -n "  GitLab 응답 대기"
+    for i in $(seq 1 60); do
+        if curl -sfk "https://${GITLAB_HOST}/-/readiness" > /dev/null 2>&1; then
+            echo ""
+            log "GitLab 응답 OK"
+            break
+        fi
+        echo -n "."
+        sleep 5
+        [ "$i" -eq 60 ] && { echo ""; warn "기동 중. kubectl get pods -n gitlab"; }
+    done
+fi
 
 step "4/4 Flux 부트스트랩"
 
-if [ -z "${GITLAB_TOKEN:-}" ]; then
-    echo ""
-    echo "  GitLab Personal Access Token이 필요합니다."
-    echo "  https://${GITLAB_HOST} → User Settings → Access Tokens"
-    echo "  Scopes: api, read_repository, write_repository"
-    echo ""
-    read -rp "  토큰 입력: " GITLAB_TOKEN
-    export GITLAB_TOKEN
-fi
+if [ "$INSTALL_GITLAB" != "true" ]; then
+    log "건너뜀 — Flux는 GitLab을 소스로 사용 (INSTALL_GITLAB=true 필요)"
+else
+    if [ -z "${GITLAB_TOKEN:-}" ]; then
+        echo ""
+        echo "  GitLab Personal Access Token이 필요합니다."
+        echo "  https://${GITLAB_HOST} → User Settings → Access Tokens"
+        echo "  Scopes: api, read_repository, write_repository"
+        echo ""
+        read -rp "  토큰 입력: " GITLAB_TOKEN
+        export GITLAB_TOKEN
+    fi
 
-[ -z "$GITLAB_TOKEN" ] && err "GITLAB_TOKEN 필요"
+    [ -z "$GITLAB_TOKEN" ] && err "GITLAB_TOKEN 필요"
 
-if [ -n "${BAO_TOKEN:-}" ]; then
     bao kv patch infra/gitlab pat="$GITLAB_TOKEN" 2>/dev/null || bao kv put infra/gitlab pat="$GITLAB_TOKEN" 2>/dev/null || true
     log "GitLab PAT → OpenBao 저장"
+
+    flux check --pre || err "Flux 사전 체크 실패"
+
+    flux bootstrap gitlab \
+        --hostname="$GITLAB_HOST" \
+        --owner="$FLUX_OWNER" \
+        --repository="$FLUX_REPO" \
+        --branch="$FLUX_BRANCH" \
+        --path="$FLUX_PATH" \
+        --token-auth \
+        --personal || err "Flux 부트스트랩 실패"
+
+    log "Flux 부트스트랩 완료!"
 fi
-
-flux check --pre || err "Flux 사전 체크 실패"
-
-flux bootstrap gitlab \
-    --hostname="$GITLAB_HOST" \
-    --owner="$FLUX_OWNER" \
-    --repository="$FLUX_REPO" \
-    --branch="$FLUX_BRANCH" \
-    --path="$FLUX_PATH" \
-    --token-auth \
-    --personal || err "Flux 부트스트랩 실패"
-
-log "Flux 부트스트랩 완료!"
 
 echo ""
 kubectl get pods -n traefik 2>/dev/null
 echo ""
-kubectl get pods -n gitlab 2>/dev/null
-echo ""
-kubectl get pods -n flux-system 2>/dev/null
+if [ "$INSTALL_GITLAB" = "true" ]; then
+    kubectl get pods -n gitlab 2>/dev/null
+    echo ""
+    kubectl get pods -n flux-system 2>/dev/null
+fi
 
 echo ""
 echo "  ┌──────────────────────────────────────────────┐"
@@ -272,8 +291,10 @@ echo "  │  ├─ MinIO          localhost:9000            │"
 echo "  │  └─ OpenBao        localhost:8200/ui         │"
 echo "  │                                              │"
 echo "  │  K8s                                         │"
-echo "  │  ├─ Traefik   https://${TS_HOSTNAME}         |"
-echo "  │  ├─ GitLab    https://${GITLAB_HOST}         |"
-echo "  │  └─ Flux      → ${FLUX_OWNER}/${FLUX_REPO}   |"
+echo "  │  ├─ Traefik   https://${TS_HOSTNAME}"
+if [ "$INSTALL_GITLAB" = "true" ]; then
+echo "  │  ├─ GitLab    https://${GITLAB_HOST}"
+echo "  │  └─ Flux      → ${FLUX_OWNER}/${FLUX_REPO}"
+fi
 echo "  └──────────────────────────────────────────────┘"
 echo ""

@@ -7,6 +7,9 @@ set -uo pipefail
 #   00 → Prerequisites (Xcode CLT, Homebrew, OrbStack, Tailscale)
 #   01 → Data (PostgreSQL, Valkey, MinIO, OpenBao, TLS)
 #   02 → K8s  (Traefik, GitLab, Flux)
+#
+# GitLab은 선택 사항 (기본값: false)
+#   INSTALL_GITLAB=true ./bootstrap/run.sh
 # ================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -16,7 +19,10 @@ RED='\033[0;31m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+export INSTALL_GITLAB="${INSTALL_GITLAB:-false}"
+
 echo -e "${CYAN}━━━ self-iac 부트스트랩 시작 ━━━${NC}"
+echo "  INSTALL_GITLAB=${INSTALL_GITLAB}"
 echo ""
 
 for script in "$SCRIPT_DIR"/[0-9][0-9]-*.sh; do

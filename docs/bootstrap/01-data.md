@@ -5,16 +5,23 @@
 ## 실행
 
 ```bash
+# GitLab 제외 (기본값)
 ./bootstrap/01-data.sh
+
+# GitLab용 리소스 포함
+INSTALL_GITLAB=true ./bootstrap/01-data.sh
 ```
+
+`INSTALL_GITLAB=true`일 때만 GitLab용 리소스(PostgreSQL `gitlab` 유저/DB, MinIO `gitlab-*` 버킷)를 만든다.
+나중에 GitLab을 켜려면 `INSTALL_GITLAB=true`로 다시 실행하면 된다 (`gitlab` 유저만 추가로 생성됨).
 
 ## 설치 순서
 
 | 순서 | 컴포넌트 | 포트 | 용도 |
 |:---:|---------|:----:|------|
-| 1 | PostgreSQL 18 | 5432 | GitLab DB + 서비스 DB |
+| 1 | PostgreSQL 18 | 5432 | 서비스 DB (+ GitLab DB) |
 | 2 | Valkey | 6379 | 캐시, 큐, 세션 |
-| 3 | MinIO | 9000/9001 | GitLab 오브젝트 스토리지 |
+| 3 | MinIO | 9000/9001 | 오브젝트 스토리지 |
 | 4 | OpenBao | 8200 | 시크릿 관리 |
 | 5 | TLS 인증서 | — | Tailscale cert 발급 |
 
@@ -25,17 +32,17 @@ brew install postgresql@18
 brew services start postgresql@18
 ```
 
-GitLab용 데이터베이스와 두 개의 유저가 자동 생성된다.
+관리용 유저가 자동 생성되며, `INSTALL_GITLAB=true`이면 GitLab용 데이터베이스와 유저도 만든다.
 
-| 유저 | 역할 | 용도 |
-|------|------|------|
-| root | 슈퍼유저 | 관리용 |
-| gitlab | 일반 유저 (CREATEDB) | GitLab 전용 |
+| 유저 | 역할 | 용도 | 생성 조건 |
+|------|------|------|-----------|
+| root | 슈퍼유저 | 관리용 | 항상 |
+| gitlab | 일반 유저 (CREATEDB) | GitLab 전용 | `INSTALL_GITLAB=true` |
 
 패스워드는 `openssl rand`로 32자 랜덤 생성되며, 자동으로 OpenBao에 저장된다.
 `pg_hba.conf`는 `scram-sha-256` 인증으로 설정된다.
 
-**확장 모듈:** `pg_trgm`, `btree_gist` (GitLab 필수)
+**확장 모듈:** `pg_trgm`, `btree_gist` (GitLab DB, `INSTALL_GITLAB=true`일 때)
 
 **네트워크:** `pg_hba.conf`에 Docker/K8s/Tailscale 대역이 추가된다.
 - `10.0.0.0/8` — K8s Pod 네트워크
@@ -62,14 +69,17 @@ valkey-cli ping   # → PONG
 
 ## 3. MinIO
 
-S3 호환 오브젝트 스토리지. GitLab의 artifacts, uploads, packages, registry, LFS, terraform state를 저장한다.
+S3 호환 오브젝트 스토리지. GitLab 사용 시 artifacts, uploads, packages, registry, LFS, terraform state를 저장한다.
+
+> [!WARNING]
+> Homebrew `minio` 포뮬러는 업스트림 저장소가 보관(archived)되어 deprecated 상태다. 추후 대체 스토리지 검토가 필요하다.
 
 ```bash
 brew install minio
 brew install minio/stable/mc
 ```
 
-**자동 생성되는 버킷:**
+**자동 생성되는 버킷 (`INSTALL_GITLAB=true`일 때):**
 
 | 버킷 | 용도 |
 |------|------|
@@ -97,6 +107,8 @@ HashiCorp Vault 호환 오픈소스 시크릿 관리 (Linux Foundation, MPL 2.0)
 brew install openbao
 ```
 
+Homebrew 설치가 실패하면 GitHub 릴리스의 `openbao_<버전>_darwin_<arch>.tar.gz`(기본 2.7.1, `OPENBAO_VERSION`)를 받아 설치한다.
+
 **초기화:** 스크립트가 자동으로 초기화하고 Unseal Key + Root Token을 발급한다.
 
 ```
@@ -109,9 +121,10 @@ brew install openbao
 
 | 경로 | 내용 |
 |------|------|
-| `infra/postgresql` | root/gitlab 유저 + 패스워드 |
+| `infra/postgresql` | root 유저 + 패스워드 (GitLab 사용 시 gitlab 유저 포함) |
 | `infra/minio` | MinIO root 자격증명 |
 | `infra/valkey` | Valkey 접속 정보 |
+| `infra/gitlab` | GitLab root 비밀번호, PAT (`02-k8s.sh`, GitLab 사용 시) |
 
 **UI 접속:** http://localhost:8200/ui (Root Token으로 로그인)
 

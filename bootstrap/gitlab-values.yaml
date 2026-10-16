@@ -1,6 +1,7 @@
 # ================================================
-# GitLab CE Helm Values
+# GitLab CE Helm Values (chart 10.5.0 / GitLab 19.5.0)
 # 호스트 PostgreSQL 18 + Valkey + MinIO
+# INSTALL_GITLAB=true 일 때만 02-k8s.sh가 사용
 # ================================================
 
 global:
@@ -16,7 +17,14 @@ global:
       name: TS_HOSTNAME_PLACEHOLDER
       https: true
 
+  # 차트 10.x(GitLab 19)부터 기본값이 Gateway API + Envoy Gateway — Traefik Ingress로 되돌림
+  gatewayApi:
+    enabled: false
+    installEnvoy: false
+
   ingress:
+    enabled: true
+    provider: traefik
     configureCertmanager: false
     class: traefik
     tls:
@@ -38,10 +46,6 @@ global:
     port: 6379
     auth:
       enabled: false
-
-  # ── 외부 MinIO (호스트) ──
-  minio:
-    enabled: false
 
   # ── SMTP (Gmail) ──
   smtp:
@@ -78,19 +82,11 @@ certmanager-issuer:
   email: false
 
 # ── 서브차트 비활성화 ──
+# (차트 10.x에서 번들 PostgreSQL/Redis/MinIO 서브차트는 제거됨)
 nginx-ingress:
   enabled: false
 
 prometheus:
-  install: false
-
-postgresql:
-  install: false
-
-redis:
-  install: false
-
-minio:
   install: false
 
 # ── GitLab Runner ──
@@ -111,7 +107,7 @@ gitlab-runner:
       [[runners]]
         [runners.kubernetes]
           namespace = "gitlab"
-          image = "ubuntu:24.04"
+          image = "ubuntu:26.04"
           privileged = true
 
 # ── GitLab 컴포넌트 리소스 ──

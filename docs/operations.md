@@ -8,12 +8,12 @@
 | Valkey | `valkey-cli` |
 | MinIO Console | http://localhost:9001 |
 | OpenBao UI | http://localhost:8200/ui |
-| GitLab | https://<tailscale-hostname> |
-| Registry | `kubectl get svc gitlab-registry -n gitlab` (LoadBalancer IP:5000) |
+| GitLab (선택) | https://<tailscale-hostname> |
+| Registry (GitLab 사용 시) | `kubectl get svc gitlab-registry -n gitlab` (LoadBalancer IP:5000) |
 
 ## 백업
 
-GitLab 백업은 **매일 04:00** 자동 실행되며 MinIO `gitlab-backups` 버킷에 저장된다.
+GitLab 사용 시 백업은 **매일 04:00** 자동 실행되며 MinIO `gitlab-backups` 버킷에 저장된다.
 
 ```bash
 # 수동 백업
@@ -52,8 +52,8 @@ brew services restart valkey
 # OpenBao도 프로세스 kill 후 재시작 + unseal 필요
 
 # K8s 워크로드
-kubectl rollout restart deployment -n gitlab
 kubectl rollout restart deployment -n traefik
+kubectl rollout restart deployment -n gitlab   # GitLab 사용 시
 ```
 
 ## OpenBao Unseal (재시작 후)
@@ -91,7 +91,7 @@ rm -rf ~/.local/share/openbao/raft ~/.local/share/openbao/init-keys.json
 rm -rf ~/.local/share/minio ~/.config/minio/env
 
 # 3. K8s 워크로드 삭제
-helm uninstall gitlab -n gitlab
+helm uninstall gitlab -n gitlab   # GitLab 사용 시
 helm uninstall traefik -n traefik
 kubectl delete ns gitlab traefik
 
@@ -100,14 +100,14 @@ brew services start postgresql@18
 psql -d postgres -c "DROP DATABASE IF EXISTS gitlab;"
 psql -d postgres -c "DROP ROLE IF EXISTS gitlab; DROP ROLE IF EXISTS root;"
 
-# 5. 부트스트랩 재실행
+# 5. 부트스트랩 재실행 (GitLab 사용 시 INSTALL_GITLAB=true)
 ./bootstrap/01-data.sh
 ./bootstrap/02-k8s.sh
 ```
 
 **`init-keys.json`은 반드시 별도 백업할 것.**
 
-## Flux GitOps 워크플로우
+## Flux GitOps 워크플로우 (GitLab 사용 시)
 
 ```bash
 # infra 레포 클론
@@ -128,12 +128,12 @@ flux get kustomizations
 
 ## SMTP (Gmail) 설정
 
-메일 발송이 필요하면 환경변수를 설정 후 Helm upgrade를 실행한다.
+GitLab 사용 시 메일 발송이 필요하면 환경변수를 설정 후 Helm upgrade를 실행한다.
 
 ```bash
 export SMTP_USER="your@gmail.com"
 export SMTP_PASSWORD="Google 앱 비밀번호"
-./bootstrap/02-k8s.sh
+INSTALL_GITLAB=true ./bootstrap/02-k8s.sh
 ```
 
 메일 발송 테스트:
@@ -151,7 +151,7 @@ kubectl logs -f deployment/gitlab-webservice-default -n gitlab
 # Traefik
 kubectl logs -f deployment/traefik -n traefik
 
-# Flux
+# Flux (GitLab 사용 시)
 flux logs
 
 # OpenBao
@@ -188,7 +188,7 @@ tailscale status
 # 출력에서 자신의 호스트명 확인 (예: mac-mini.tail12345.ts.net)
 ```
 
-### GitLab Pod가 기동 안 됨
+### GitLab Pod가 기동 안 됨 (GitLab 사용 시)
 
 ```bash
 kubectl get pods -n gitlab
