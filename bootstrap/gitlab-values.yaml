@@ -1,6 +1,6 @@
 # ================================================
 # GitLab CE Helm Values (chart 10.5.0 / GitLab 19.5.0)
-# 호스트 PostgreSQL 18 + Valkey + MinIO
+# 호스트 PostgreSQL 18 + Valkey + Garage(S3)
 # INSTALL_GITLAB=true 일 때만 02-k8s.sh가 사용
 # ================================================
 
@@ -68,13 +68,30 @@ global:
   # ── API Rate Limit 완화 (LLM 자동화용) ──
   appConfig:
     applicationSettingsCacheSeconds: 60
+
+    # ── 오브젝트 스토리지 (호스트 Garage, Secret은 02-k8s.sh가 생성) ──
+    # host.docker.internal은 클러스터 밖(브라우저, git-lfs)에서 접근할 수 없으므로 다운로드는 GitLab이 프록시
     object_store:
       enabled: true
+      proxy_download: true
       connection:
-        secret: gitlab-minio-secret
+        secret: gitlab-object-storage
         key: connection
+    # 01-data.sh가 만드는 버킷 이름 (lfs/terraformState/backups.tmpBucket은 차트 기본값과 다름)
+    artifacts:
+      bucket: gitlab-artifacts
+    uploads:
+      bucket: gitlab-uploads
+    packages:
+      bucket: gitlab-packages
+    lfs:
+      bucket: gitlab-lfs
     terraformState:
       enabled: true
+      bucket: gitlab-terraform
+    backups:
+      bucket: gitlab-backups
+      tmpBucket: gitlab-tmp
 
 installCertmanager: false
 
@@ -95,20 +112,25 @@ gitlab-runner:
   gitlabUrl: http://gitlab-webservice-default.gitlab.svc.cluster.local:8080
   runners:
     privileged: true
+    # 차트는 이 Secret의 accesskey/secretkey를 CACHE_S3_ACCESS_KEY/SECRET_KEY로 내보내기만 함
+    # 나머지 캐시 설정은 아래 config의 [runners.cache]에 둬야 적용됨
     cache:
-      cacheType: s3
-      s3BucketName: gitlab-runner-cache
-      s3BucketLocation: us-east-1
-      s3ServerAddress: host.docker.internal:9000
-      s3Insecure: true
       secretName: gitlab-runner-cache-secret
-      cacheShared: true
     config: |
       [[runners]]
         [runners.kubernetes]
           namespace = "gitlab"
           image = "ubuntu:26.04"
           privileged = true
+        [runners.cache]
+          Type = "s3"
+          Shared = true
+          [runners.cache.s3]
+            ServerAddress = "host.docker.internal:3900"
+            BucketName = "gitlab-runner-cache"
+            BucketLocation = "garage"
+            Insecure = true
+            AuthenticationType = "access-key"
 
 # ── GitLab 컴포넌트 리소스 ──
 gitlab:
@@ -160,10 +182,11 @@ gitlab:
         enabled: true
         schedule: "0 4 * * *"
         extraArgs: "--skip artifacts"
+      # backup-utility는 s3cmd 설정 파일을 읽음 (fog 연결 형식 아님)
       objectStorage:
         config:
-          secret: gitlab-minio-secret
-          key: connection
+          secret: gitlab-object-storage-s3cmd
+          key: config
     resources:
       requests:
         cpu: 50m
@@ -192,6 +215,9 @@ registry:
   storage:
     secret: gitlab-registry-storage
     key: config
+    # docker 클라이언트가 host.docker.internal로 리다이렉트되지 않도록 Registry가 직접 전달
+    redirect:
+      disable: true
   maintenance:
     gc:
       disabled: false

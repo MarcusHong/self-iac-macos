@@ -53,7 +53,7 @@ if [ "$INSTALL_GITLAB" = "true" ]; then
 
     psql -d postgres -c "SELECT 1;" &>/dev/null || err "PostgreSQL 미실행 (01-data.sh 먼저)"
     valkey-cli ping 2>/dev/null | grep -q "PONG" || err "Valkey 미실행"
-    curl -sf http://localhost:9000/minio/health/live &>/dev/null || err "MinIO 미실행"
+    curl -sf http://127.0.0.1:3903/health &>/dev/null || err "Garage 미실행 또는 비정상 (01-data.sh 먼저)"
 fi
 curl -sf http://127.0.0.1:8200/v1/sys/seal-status &>/dev/null || err "OpenBao 미실행"
 log "호스트 데이터 레이어 OK"
@@ -81,16 +81,20 @@ if [ -f "$OPENBAO_DATA_DIR/init-keys.json" ]; then
 fi
 [ -n "${BAO_TOKEN:-}" ] || err "OpenBao 토큰 없음 — 01-data.sh를 먼저 실행하세요"
 
-MINIO_USER=""
-MINIO_PASS=""
+S3_ENDPOINT=""
+S3_REGION=""
+S3_ACCESS_KEY=""
+S3_SECRET_KEY=""
 PG_GITLAB_PASS=""
 if [ "$INSTALL_GITLAB" = "true" ]; then
-    MINIO_USER=$(bao kv get -field=root_user infra/minio 2>/dev/null || echo "minioadmin")
-    MINIO_PASS=$(bao kv get -field=root_password infra/minio 2>/dev/null || echo "")
+    S3_ENDPOINT=$(bao kv get -field=endpoint infra/garage 2>/dev/null || echo "http://host.docker.internal:3900")
+    S3_REGION=$(bao kv get -field=region infra/garage 2>/dev/null || echo "garage")
+    S3_ACCESS_KEY=$(bao kv get -field=gitlab_access_key infra/garage 2>/dev/null || echo "")
+    S3_SECRET_KEY=$(bao kv get -field=gitlab_secret_key infra/garage 2>/dev/null || echo "")
     PG_GITLAB_PASS=$(bao kv get -field=gitlab_password infra/postgresql 2>/dev/null || echo "")
-    [ -n "$MINIO_PASS" ] || err "OpenBao에 infra/minio 시크릿 없음 — 01-data.sh를 먼저 실행하세요"
+    [ -n "$S3_ACCESS_KEY" ] && [ -n "$S3_SECRET_KEY" ] || err "OpenBao에 infra/garage GitLab 키 없음 — INSTALL_GITLAB=true ./bootstrap/01-data.sh 먼저"
     [ -n "$PG_GITLAB_PASS" ] || err "OpenBao에 infra/postgresql gitlab 패스워드 없음 — INSTALL_GITLAB=true ./bootstrap/01-data.sh 먼저"
-    log "OpenBao에서 시크릿 로드 (minio, postgresql)"
+    log "OpenBao에서 시크릿 로드 (garage, postgresql)"
 fi
 
 step "2/4 Traefik"
@@ -124,29 +128,52 @@ else
         --from-literal=password="${PG_GITLAB_PASS}" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-    kubectl create secret generic gitlab-minio-secret \
+    # ── 오브젝트 스토리지 시크릿 (호스트 Garage) ──
+    # 형식은 GitLab 차트 문서의 Garage 예시를 따름 (docs.gitlab.com/charts/installation/migration/bundled_chart_migration)
+    S3_HOSTPORT="${S3_ENDPOINT#*://}"
+
+    # Rails/Workhorse (fog) 연결
+    kubectl create secret generic gitlab-object-storage \
         --namespace gitlab \
         --from-literal=connection="$(cat << EOF
 provider: AWS
-endpoint: http://host.docker.internal:9000
-aws_access_key_id: ${MINIO_USER}
-aws_secret_access_key: ${MINIO_PASS}
-region: us-east-1
+region: ${S3_REGION}
+endpoint: ${S3_ENDPOINT}
+aws_access_key_id: ${S3_ACCESS_KEY}
+aws_secret_access_key: ${S3_SECRET_KEY}
 path_style: true
 EOF
 )" \
         --dry-run=client -o yaml | kubectl apply -f -
 
+    # toolbox 백업/복원은 s3cmd 설정 파일 형식을 사용
+    kubectl create secret generic gitlab-object-storage-s3cmd \
+        --namespace gitlab \
+        --from-literal=config="$(cat << EOF
+[default]
+access_key = ${S3_ACCESS_KEY}
+secret_key = ${S3_SECRET_KEY}
+host_base = ${S3_HOSTPORT}
+host_bucket = ${S3_HOSTPORT}
+bucket_location = ${S3_REGION}
+use_https = False
+EOF
+)" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # GitLab 19부터 s3는 s3_v2(AWS SDK v2) 별칭 — regionendpoint에 스킴 필수, host.docker.internal은 path-style 필수
     kubectl create secret generic gitlab-registry-storage \
         --namespace gitlab \
         --from-literal=config="$(cat << EOF
 s3:
   bucket: gitlab-registry
-  accesskey: ${MINIO_USER}
-  secretkey: ${MINIO_PASS}
-  regionendpoint: http://host.docker.internal:9000
-  region: us-east-1
+  accesskey: ${S3_ACCESS_KEY}
+  secretkey: ${S3_SECRET_KEY}
+  region: ${S3_REGION}
+  regionendpoint: ${S3_ENDPOINT}
+  secure: false
   v4auth: true
+  pathstyle: true
 EOF
 )" \
         --dry-run=client -o yaml | kubectl apply -f -
@@ -177,8 +204,8 @@ EOF
     # ── Runner 캐시 시크릿 ──
     kubectl create secret generic gitlab-runner-cache-secret \
         --namespace gitlab \
-        --from-literal=accesskey="${MINIO_USER}" \
-        --from-literal=secretkey="${MINIO_PASS}" \
+        --from-literal=accesskey="${S3_ACCESS_KEY}" \
+        --from-literal=secretkey="${S3_SECRET_KEY}" \
         --dry-run=client -o yaml | kubectl apply -f -
     log "Runner 캐시 시크릿 생성"
 
@@ -280,7 +307,7 @@ echo "  ┌───────────────────────
 echo "  │  호스트                                        │"
 echo "  │  ├─ PostgreSQL 18  localhost:5432            │"
 echo "  │  ├─ Valkey         localhost:6379            │"
-echo "  │  ├─ MinIO          localhost:9000            │"
+echo "  │  ├─ Garage (S3)    localhost:3900            │"
 echo "  │  └─ OpenBao        localhost:8200/ui         │"
 echo "  │                                              │"
 echo "  │  K8s                                         │"

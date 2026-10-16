@@ -6,22 +6,39 @@
 |--------|----------------|
 | PostgreSQL | `psql -d postgres` |
 | Valkey | `valkey-cli` |
-| MinIO Console | http://localhost:9001 |
+| Garage (S3) | http://localhost:3900 (콘솔 없음 — `garage` CLI, 아래 참고) |
 | OpenBao UI | http://localhost:8200/ui |
 | Argo CD | https://<tailscale-hostname>/argocd |
 | GitLab (선택) | https://<tailscale-hostname> |
 | Registry (GitLab 사용 시) | `kubectl get svc gitlab-registry -n gitlab` (LoadBalancer IP:5000) |
 
+## Garage (오브젝트 스토리지)
+
+`brew services`(launchd)로 기동되므로 재부팅 후 자동으로 올라온다. 관리는 `garage` CLI로 한다.
+
+```bash
+export GARAGE_CONFIG_FILE=$(brew --prefix)/etc/garage/config.toml
+
+garage status                          # 노드/용량
+curl -s http://127.0.0.1:3903/health   # 클러스터 상태
+garage bucket list
+garage bucket info gitlab-artifacts    # 오브젝트 수, 용량
+garage key info gitlab                 # 키 권한 (--show-secret으로 비밀 키 표시)
+```
+
+기존 MinIO 데이터 이전은 [MinIO → Garage 이전](migrate-minio-to-garage.md) 참고.
+
 ## 백업
 
-GitLab 사용 시 백업은 **매일 04:00** 자동 실행되며 MinIO `gitlab-backups` 버킷에 저장된다.
+GitLab 사용 시 백업은 **매일 04:00** 자동 실행되며 Garage `gitlab-backups` 버킷에 저장된다.
+(오브젝트 데이터와 백업이 같은 Garage에 있으므로 `~/.local/share/garage`도 디스크 단위로 따로 백업할 것)
 
 ```bash
 # 수동 백업
-kubectl exec -n gitlab deployment/gitlab-toolbox -- gitlab-backup create
+kubectl exec -n gitlab deployment/gitlab-toolbox -- backup-utility
 
-# 백업 목록 확인
-mc ls local/gitlab-backups/
+# 백업 목록 확인 (toolbox에 s3cmd 설정이 들어 있음)
+kubectl exec -n gitlab deployment/gitlab-toolbox -- s3cmd ls s3://gitlab-backups/
 
 # PostgreSQL 별도 백업
 pg_dump gitlab > gitlab_$(date +%Y%m%d).sql
@@ -40,7 +57,7 @@ Registry GC는 **매주 일요일 05:00** 자동 실행된다.
 kubectl rollout restart deployment -n gitlab -l app=registry
 
 # Registry 용량 확인
-mc du local/gitlab-registry/
+garage -c $(brew --prefix)/etc/garage/config.toml bucket info gitlab-registry
 ```
 
 ## 서비스 재시작
@@ -49,7 +66,7 @@ mc du local/gitlab-registry/
 # 호스트 서비스
 brew services restart postgresql@18
 brew services restart valkey
-# MinIO는 프로세스 kill 후 ./bootstrap/01-data.sh 재실행 (~/.config/minio/env 자격증명으로 재기동)
+brew services restart garage
 # OpenBao도 프로세스 kill 후 재시작 + unseal 필요
 
 # K8s 워크로드
@@ -76,8 +93,8 @@ OpenBao는 모든 시크릿의 중앙 저장소다.
 | 서비스 | 영향 |
 |--------|------|
 | PostgreSQL | root/gitlab 유저 비밀번호 분실 → DB 접근 불가 |
-| MinIO | root 비밀번호 분실 → 오브젝트 스토리지 접근 불가 |
-| GitLab | K8s Secret의 DB/MinIO 비밀번호 불일치 → 기동 실패 |
+| Garage | 영향 없음 — 키는 Garage 메타데이터에 있고 `01-data.sh`가 `infra/garage`로 다시 복사 |
+| GitLab | K8s Secret의 DB 비밀번호 불일치 → 기동 실패 |
 
 **복구 절차:**
 
@@ -85,12 +102,10 @@ OpenBao는 모든 시크릿의 중앙 저장소다.
 # 1. 호스트 서비스 전체 중지
 brew services stop postgresql@18
 brew services stop valkey
-pkill -f minio
 pkill -f "bao server"
 
 # 2. 데이터 삭제
 rm -rf ~/.local/share/openbao/raft ~/.local/share/openbao/init-keys.json
-rm -rf ~/.local/share/minio ~/.config/minio/env
 
 # 3. K8s 워크로드 삭제
 helm uninstall gitlab -n gitlab   # GitLab 사용 시
@@ -160,8 +175,8 @@ kubectl logs -f statefulset/argocd-application-controller -n argocd
 # OpenBao
 tail -f ~/.local/share/openbao/openbao.log
 
-# MinIO
-tail -f ~/.local/share/minio/minio.log
+# Garage
+tail -f $(brew --prefix)/var/log/garage.log
 ```
 
 ## TLS 인증서 수동 갱신
@@ -199,7 +214,7 @@ kubectl describe pod <pod-name> -n gitlab
 kubectl logs <pod-name> -n gitlab
 ```
 
-보통 원인: 호스트 PostgreSQL/Valkey/MinIO에 연결 실패.
+보통 원인: 호스트 PostgreSQL/Valkey/Garage에 연결 실패.
 `host.docker.internal` 해석 확인:
 
 ```bash
@@ -221,11 +236,25 @@ psql -d postgres -c "SHOW listen_addresses;"
 # → * 이어야 함
 ```
 
-### MinIO 시작 실패
+### Garage 시작 실패
 
 ```bash
-tail -20 ~/.local/share/minio/minio.log
+brew services info garage
+tail -20 $(brew --prefix)/var/log/garage.log
 
 # 포트 충돌 확인
-lsof -i :9000
+lsof -i :3900 -i :3901 -i :3903
+
+# 설정 파일 권한 — 다른 사용자가 읽을 수 있으면 Garage가 기동을 거부함
+ls -l $(brew --prefix)/etc/garage/config.toml   # -rw------- 이어야 함
+```
+
+### GitLab 업로드/다운로드/Registry push 실패 (GitLab 사용 시)
+
+```bash
+# Pod에서 Garage S3 포트 도달 여부 (403 AccessDenied가 나오면 정상 — 인증 없는 요청이라서)
+kubectl run s3test --rm -it --image=curlimages/curl -- curl -s -o /dev/null -w '%{http_code}\n' http://host.docker.internal:3900/
+
+# 키 권한 확인 — 모든 gitlab-* 버킷에 RW가 있어야 함
+garage -c $(brew --prefix)/etc/garage/config.toml key info gitlab
 ```

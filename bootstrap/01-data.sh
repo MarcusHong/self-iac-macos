@@ -7,13 +7,13 @@ set -uo pipefail
 #   ① 사전 체크
 #   ② PostgreSQL 18
 #   ③ Valkey
-#   ④ MinIO
+#   ④ Garage (S3 오브젝트 스토리지)
 #   ⑤ OpenBao
 #   ⑥ Tailscale TLS 인증서
 #   ⑦ 인증서 갱신 cron
 #
 # INSTALL_GITLAB=true 일 때만 GitLab용 리소스(PG gitlab 유저/DB,
-# MinIO gitlab-* 버킷)를 만든다. 기본값: false
+# Garage gitlab 키 + gitlab-* 버킷)를 만든다. 기본값: false
 # ================================================
 
 GREEN='\033[0;32m'
@@ -31,21 +31,17 @@ step() { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 INSTALL_GITLAB="${INSTALL_GITLAB:-false}"
 PG_VERSION="18"
 OPENBAO_VERSION="2.7.1"   # brew 설치 실패 시 바이너리 다운로드 버전
-MINIO_ROOT_USER="minioadmin"
-MINIO_ROOT_PASS=""
-MINIO_DATA_DIR="$HOME/.local/share/minio"
-MINIO_CONFIG_DIR="$HOME/.config/minio"
-MINIO_ENV_FILE="$MINIO_CONFIG_DIR/env"
+GARAGE_DATA_DIR="$HOME/.local/share/garage"
+GARAGE_S3_PORT="3900"
+GARAGE_ADMIN_PORT="3903"
+GARAGE_REGION="garage"
+GARAGE_GITLAB_KEY="gitlab"   # GitLab 전용 S3 키 이름
+GARAGE_GITLAB_BUCKETS="gitlab-artifacts gitlab-uploads gitlab-packages gitlab-registry gitlab-lfs gitlab-terraform gitlab-backups gitlab-tmp gitlab-runner-cache"
 OPENBAO_DATA_DIR="$HOME/.local/share/openbao"
 OPENBAO_CONFIG_DIR="$HOME/.config/openbao"
 CERT_DIR="$HOME/.local/share/tailscale-certs"
 
 gen_pass() { openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32; }
-
-# MinIO는 기동할 때마다 같은 root 자격증명이 필요하므로 파일(0600)에 보관
-write_minio_env() {
-    (umask 077; printf 'MINIO_ROOT_USER=%s\nMINIO_ROOT_PASSWORD=%s\n' "$MINIO_ROOT_USER" "$MINIO_ROOT_PASS" > "$MINIO_ENV_FILE")
-}
 
 step "1/7 사전 체크"
 
@@ -279,59 +275,115 @@ else
     err "Valkey 시작 실패"
 fi
 
-step "4/7 MinIO"
+step "4/7 Garage"
 
-if ! command -v minio &>/dev/null; then
-    echo "  MinIO 설치 중..."
-    brew install minio
+if ! brew list garage &>/dev/null; then
+    echo "  Garage 설치 중..."
+    brew install garage
 fi
 
-if ! command -v mc &>/dev/null; then
-    brew install minio/stable/mc
-fi
+# brew services(launchd)가 이 경로의 설정으로 기동 — 재부팅 후 자동 시작
+GARAGE_CONFIG="$(brew --prefix)/etc/garage/config.toml"
+GARAGE_LOG="$(brew --prefix)/var/log/garage.log"
+garage_cli() { garage -c "$GARAGE_CONFIG" "$@"; }
 
-mkdir -p "$MINIO_DATA_DIR" "$MINIO_CONFIG_DIR"
+mkdir -p "$GARAGE_DATA_DIR/meta" "$GARAGE_DATA_DIR/data" "$(dirname "$GARAGE_CONFIG")"
 
-# 재실행(재부팅 후 등) 시 저장된 자격증명을 재사용 — 새로 생성하면 OpenBao/K8s Secret과 어긋남
-if [ -f "$MINIO_ENV_FILE" ]; then
-    source "$MINIO_ENV_FILE"
-    MINIO_ROOT_PASS="${MINIO_ROOT_PASSWORD:-}"
-fi
-
-if curl -sf http://localhost:9000/minio/health/live &>/dev/null; then
-    log "MinIO 이미 실행 중 — localhost:9000 (콘솔: 9001)"
+# rpc_secret/admin_token이 들어 있으므로 0600 (Garage는 다른 사용자가 읽을 수 있는 시크릿 파일을 거부함)
+# 재실행 시 덮어쓰지 않음 — 시크릿이 바뀌면 CLI가 기존 노드에 접속하지 못함
+if [ -s "$GARAGE_CONFIG" ]; then
+    log "Garage 설정 유지 — ${GARAGE_CONFIG}"
 else
-    if [ -z "$MINIO_ROOT_PASS" ]; then
-        if [ -d "$MINIO_DATA_DIR/.minio.sys" ]; then
-            warn "기존 MinIO 데이터가 있지만 자격증명 파일이 없음 — 새 패스워드로 기동 (완료 후 02-k8s.sh 재실행 필요)"
+    (umask 077; cat > "$GARAGE_CONFIG" << EOF
+metadata_dir = "${GARAGE_DATA_DIR}/meta"
+data_dir = "${GARAGE_DATA_DIR}/data"
+
+# 단일 노드: LMDB는 비정상 종료 시 메타데이터 손상 위험이 있어 sqlite + fsync + 자동 스냅샷 사용
+db_engine = "sqlite"
+metadata_fsync = true
+metadata_auto_snapshot_interval = "6h"
+replication_factor = 1
+
+rpc_bind_addr = "127.0.0.1:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "$(openssl rand -hex 32)"
+
+# K8s Pod가 host.docker.internal로 접근하므로 S3 API는 모든 인터페이스에 바인딩
+[s3_api]
+s3_region = "${GARAGE_REGION}"
+api_bind_addr = "0.0.0.0:${GARAGE_S3_PORT}"
+
+[admin]
+api_bind_addr = "127.0.0.1:${GARAGE_ADMIN_PORT}"
+admin_token = "$(openssl rand -base64 32)"
+metrics_token = "$(openssl rand -base64 32)"
+EOF
+    )
+    log "Garage 설정 생성 — ${GARAGE_CONFIG}"
+fi
+
+if garage_cli status &>/dev/null; then
+    log "Garage 이미 실행 중 — localhost:${GARAGE_S3_PORT}"
+else
+    # 설정 없이 먼저 등록된 서비스가 재시작 루프에 있을 수 있으므로 start 대신 restart
+    brew services restart garage
+    echo -n "  Garage 시작 대기"
+    for i in $(seq 1 20); do
+        if garage_cli status &>/dev/null; then
+            echo ""
+            log "Garage 시작됨 — localhost:${GARAGE_S3_PORT}"
+            break
         fi
-        MINIO_ROOT_PASS=$(gen_pass)
-        write_minio_env
-        log "MinIO 자격증명 생성 — ${MINIO_ENV_FILE}"
-    fi
-    MINIO_ROOT_USER="$MINIO_ROOT_USER" \
-    MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASS" \
-    nohup minio server "$MINIO_DATA_DIR" \
-        --address ":9000" \
-        --console-address ":9001" \
-        > "$MINIO_DATA_DIR/minio.log" 2>&1 &
-    sleep 3
-    curl -sf http://localhost:9000/minio/health/live &>/dev/null || err "MinIO 시작 실패. 로그: $MINIO_DATA_DIR/minio.log"
-    log "MinIO 시작됨 — localhost:9000 (콘솔: 9001)"
+        echo -n "."
+        sleep 1
+        [ "$i" -eq 20 ] && { echo ""; err "Garage 시작 실패. 로그: ${GARAGE_LOG}"; }
+    done
 fi
 
-# GitLab 버킷은 INSTALL_GITLAB=true 이고 비밀번호를 알 때만 생성
-# (자격증명 파일이 없는 이전 설치는 OpenBao 단계에서 파일을 복원)
+# 첫 기동 시 단일 노드 레이아웃 적용 (단일 노드에서는 용량 값이 데이터 배치에 영향 없음)
+if garage_cli status 2>/dev/null | grep -q "NO ROLE ASSIGNED"; then
+    GARAGE_NODE_ID=$(garage_cli node id -q 2>/dev/null | cut -d@ -f1)
+    GARAGE_LAYOUT_VER=$(garage_cli layout show 2>/dev/null | grep -oE 'layout version: [0-9]+' | grep -oE '[0-9]+$')
+    { garage_cli layout assign -z dc1 -c 1T "$GARAGE_NODE_ID" > /dev/null \
+        && garage_cli layout apply --version $(( ${GARAGE_LAYOUT_VER:-0} + 1 )) > /dev/null; } \
+        || err "Garage 레이아웃 적용 실패 — garage -c ${GARAGE_CONFIG} layout show 로 확인"
+    log "Garage 단일 노드 레이아웃 적용"
+fi
+
+# /health는 레이아웃이 적용되고 모든 파티션이 쓸 수 있을 때만 200
+for i in $(seq 1 10); do
+    curl -sf "http://127.0.0.1:${GARAGE_ADMIN_PORT}/health" &>/dev/null && break
+    sleep 1
+    [ "$i" -eq 10 ] && err "Garage 클러스터 비정상 — garage -c ${GARAGE_CONFIG} status 로 확인"
+done
+log "Garage 클러스터 정상 (admin: localhost:${GARAGE_ADMIN_PORT})"
+
+# GitLab 키와 버킷은 INSTALL_GITLAB=true 일 때만
+# 키는 Garage 메타데이터에 남으므로 재실행 시 새로 만들지 않고 기존 값을 읽어 씀
+GARAGE_GITLAB_KEY_ID=""
+GARAGE_GITLAB_SECRET=""
 if [ "$INSTALL_GITLAB" != "true" ]; then
-    log "GitLab 버킷 건너뜀 (INSTALL_GITLAB=${INSTALL_GITLAB})"
-elif [ -n "$MINIO_ROOT_PASS" ]; then
-    mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASS" 2>/dev/null || true
-    for bucket in gitlab-artifacts gitlab-uploads gitlab-packages gitlab-registry gitlab-lfs gitlab-terraform gitlab-backups gitlab-runner-cache; do
-        mc mb "local/${bucket}" 2>/dev/null || true
-    done
-    log "MinIO 버킷 생성 완료"
+    log "GitLab 키/버킷 건너뜀 (INSTALL_GITLAB=${INSTALL_GITLAB})"
 else
-    log "MinIO 이미 실행 중 — 자격증명 파일 없음, 버킷 생성 건너뜀"
+    if ! garage_cli key info "$GARAGE_GITLAB_KEY" &>/dev/null; then
+        garage_cli key create "$GARAGE_GITLAB_KEY" > /dev/null || err "Garage 키 생성 실패: ${GARAGE_GITLAB_KEY}"
+        log "Garage 키 생성: ${GARAGE_GITLAB_KEY}"
+    fi
+    GARAGE_KEY_INFO=$(garage_cli key info "$GARAGE_GITLAB_KEY" --show-secret 2>/dev/null)
+    GARAGE_GITLAB_KEY_ID=$(echo "$GARAGE_KEY_INFO" | awk '/^Key ID:/ {print $NF}')
+    GARAGE_GITLAB_SECRET=$(echo "$GARAGE_KEY_INFO" | awk '/^Secret key:/ {print $NF}')
+    [ -n "$GARAGE_GITLAB_KEY_ID" ] && [ -n "$GARAGE_GITLAB_SECRET" ] || err "Garage 키 정보 읽기 실패: ${GARAGE_GITLAB_KEY}"
+
+    for bucket in $GARAGE_GITLAB_BUCKETS; do
+        garage_cli bucket info "$bucket" &>/dev/null || garage_cli bucket create "$bucket" > /dev/null
+        garage_cli bucket allow --read --write "$bucket" --key "$GARAGE_GITLAB_KEY" > /dev/null \
+            || err "Garage 버킷 권한 설정 실패: ${bucket}"
+    done
+    log "Garage 버킷 준비 완료 (키 ${GARAGE_GITLAB_KEY}: 읽기/쓰기)"
+fi
+
+if [ -d "$HOME/.local/share/minio" ]; then
+    warn "이전 MinIO 데이터 발견 (~/.local/share/minio) — 이전 절차: docs/migrate-minio-to-garage.md"
 fi
 
 step "5/7 OpenBao"
@@ -506,27 +558,23 @@ if [ -n "${ROOT_TOKEN:-}" ]; then
         echo "  스크립트를 다시 실행하고 패스워드 재생성에 Y를 선택하세요."
     fi
 
-    if [ -n "$MINIO_ROOT_PASS" ]; then
-        # 매 실행마다 같은 값이면 새 버전을 만들지 않음
-        if [ "$(bao kv get -field=root_password infra/minio 2>/dev/null)" != "$MINIO_ROOT_PASS" ]; then
-            bao kv put infra/minio \
-                root_user="$MINIO_ROOT_USER" \
-                root_password="$MINIO_ROOT_PASS" 2>/dev/null || true
+    # Garage GitLab 키 — 02-k8s.sh가 읽어 K8s Secret 생성 (같은 값이면 새 버전을 만들지 않음)
+    if [ -n "$GARAGE_GITLAB_SECRET" ]; then
+        if [ "$(bao kv get -field=gitlab_secret_key infra/garage 2>/dev/null)" != "$GARAGE_GITLAB_SECRET" ]; then
+            bao kv put infra/garage \
+                endpoint="http://host.docker.internal:${GARAGE_S3_PORT}" \
+                region="$GARAGE_REGION" \
+                gitlab_access_key="$GARAGE_GITLAB_KEY_ID" \
+                gitlab_secret_key="$GARAGE_GITLAB_SECRET" 2>/dev/null || true
         fi
-    elif MINIO_ROOT_PASS=$(bao kv get -field=root_password infra/minio 2>/dev/null) && [ -n "$MINIO_ROOT_PASS" ]; then
-        # 자격증명 파일 도입 이전 설치: OpenBao 값으로 파일 복원
-        MINIO_ROOT_USER=$(bao kv get -field=root_user infra/minio 2>/dev/null || echo "$MINIO_ROOT_USER")
-        write_minio_env
-        log "MinIO 자격증명 파일 복원 (OpenBao infra/minio) — ${MINIO_ENV_FILE}"
-    else
-        warn "MinIO 비밀번호를 알 수 없음 — MinIO 데이터를 삭제하고 재실행하세요"
+        log "시크릿 저장: infra/garage"
     fi
 
     bao kv put infra/valkey \
         host="host.docker.internal" \
         port="6379" 2>/dev/null || true
 
-    log "시크릿 저장: infra/minio, infra/valkey"
+    log "시크릿 저장: infra/valkey"
     unset BAO_TOKEN
 fi
 
@@ -589,7 +637,7 @@ echo "  │  호스트 데이터 레이어 완료                         │"
 echo "  │                                              │"
 echo "  │  PostgreSQL 18  localhost:5432               │"
 echo "  │  Valkey         localhost:6379               │"
-echo "  │  MinIO          localhost:9000 (콘솔:9001)    │"
+echo "  │  Garage (S3)    localhost:3900 (admin:3903)   │"
 echo "  │  OpenBao        localhost:8200 (UI: /ui)     │"
 echo "  │                                              │"
 echo "  │  TLS: ${TS_HOSTNAME}                         │"

@@ -5,7 +5,7 @@ Argo CD로 서비스를 배포하고(OCI Ops), 필요하면 GitLab CE를 함께 
 
 ## 개요
 
-headless 서버로 운영하며, 호스트에 데이터 레이어(PostgreSQL, Valkey, MinIO, OpenBao)를
+headless 서버로 운영하며, 호스트에 데이터 레이어(PostgreSQL, Valkey, Garage, OpenBao)를
 네이티브로 설치하고 OrbStack K8s 위에 워크로드(Traefik, Argo CD, 선택적으로 GitLab)를 배포한다.
 
 외부 접근은 Tailscale VPN 메시를 통해 이루어지며, Let's Encrypt 정식 인증서로 HTTPS를 제공한다.
@@ -16,7 +16,7 @@ headless 서버로 운영하며, 호스트에 데이터 레이어(PostgreSQL, Va
 | 레이어 | 구성 | 역할 |
 |--------|------|------|
 | **네트워크** | Tailscale | VPN 메시, MagicDNS, TLS 인증서 |
-| **호스트** | PostgreSQL 18, Valkey, MinIO, OpenBao | 데이터, 캐시, 오브젝트 스토리지, 시크릿 |
+| **호스트** | PostgreSQL 18, Valkey, Garage, OpenBao | 데이터, 캐시, 오브젝트 스토리지(S3), 시크릿 |
 | **K8s** | Traefik, Argo CD, GitLab CE (선택) | Ingress, GitOps, CI/CD |
 | **자동화** | 격월 인증서 갱신 (+ GitLab 사용 시 일일 백업, 주간 Registry GC) | 무인 운영 |
 
@@ -28,7 +28,7 @@ GitLab은 기본으로 설치하지 않는다. 설치하려면 `INSTALL_GITLAB=t
 INSTALL_GITLAB=true ./bootstrap/run.sh
 ```
 
-`INSTALL_GITLAB=true`이면 PostgreSQL `gitlab` 유저/DB와 MinIO `gitlab-*` 버킷을 만들고 GitLab을 설치한다.
+`INSTALL_GITLAB=true`이면 PostgreSQL `gitlab` 유저/DB와 Garage `gitlab` 키·`gitlab-*` 버킷을 만들고 GitLab을 설치한다.
 
 ### 구성 요소 버전
 
@@ -41,7 +41,7 @@ INSTALL_GITLAB=true ./bootstrap/run.sh
 | GitLab CE | chart 10.5.0 / 19.5.0 | `02-k8s.sh` `GITLAB_CHART_VERSION` |
 | GitLab Runner 기본 이미지 | `ubuntu:26.04` | `gitlab-values.yaml` |
 
-Valkey, MinIO, kubectl, Helm, Argo CD CLI, Tailscale은 설치 시점의 Homebrew 최신 버전을 사용한다.
+Valkey, Garage, kubectl, Helm, Argo CD CLI, Tailscale은 설치 시점의 Homebrew 최신 버전을 사용한다.
 
 ## 아키텍처
 
@@ -50,7 +50,7 @@ Valkey, MinIO, kubectl, Helm, Argo CD CLI, Tailscale은 설치 시점의 Homebre
 │                                                       │
 │  ┌─ Host (Native) ─────────────────────────────────┐  │
 │  │  PostgreSQL 18  :5432      Valkey     :6379     │  │
-│  │  MinIO          :9000      OpenBao    :8200     │  │
+│  │  Garage (S3)    :3900      OpenBao    :8200     │  │
 │  └────────────────────────┬────────────────────────┘  │
 │                           │ host.docker.internal      │
 │  ┌─ OrbStack K8s ─────────┴────────────────────────┐  │
@@ -99,7 +99,7 @@ self-iac/
 │   ├── run.sh                 # 전체 순차 실행
 │   ├── 00-prerequisites.sh    # 서버 설정 + Xcode CLT, Homebrew, OrbStack, Tailscale
 │   ├── client.sh              # 랩탑에서 원격 OrbStack kubeconfig 구성
-│   ├── 01-data.sh             # PostgreSQL, Valkey, MinIO, OpenBao, TLS
+│   ├── 01-data.sh             # PostgreSQL, Valkey, Garage, OpenBao, TLS
 │   ├── 02-k8s.sh              # Traefik, GitLab (선택), Argo CD
 │   ├── argocd-values.yaml     # Argo CD Helm values
 │   ├── gitlab-values.yaml     # GitLab Helm values
@@ -120,6 +120,7 @@ self-iac/
     │   ├── 01-data.md
     │   └── 02-k8s.md
     ├── argocd.md
+    ├── migrate-minio-to-garage.md
     └── operations.md
 ```
 
@@ -130,12 +131,13 @@ self-iac/
 - [02 - K8s 워크로드](docs/bootstrap/02-k8s.md)
 - [Argo CD 운영](docs/argocd.md)
 - [운영 가이드](docs/operations.md)
+- [MinIO → Garage 이전](docs/migrate-minio-to-garage.md)
 
 ## 리소스 예상 사용량
 
 | 구분 | RAM |
 |------|:---:|
-| 호스트 (PG, Valkey, MinIO, OpenBao, macOS) | ~4.6GB |
+| 호스트 (PG, Valkey, Garage, OpenBao, macOS) | ~4.6GB |
 | K8s (Traefik, Argo CD, limit 기준) | ~2.3GB |
 | K8s (GitLab, 선택, limit 기준) | +~6GB |
 | **합계 (GitLab 포함)** | **~12.9GB** |

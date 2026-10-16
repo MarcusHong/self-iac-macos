@@ -12,8 +12,8 @@
 INSTALL_GITLAB=true ./bootstrap/01-data.sh
 ```
 
-`INSTALL_GITLAB=true`일 때만 GitLab용 리소스(PostgreSQL `gitlab` 유저/DB, MinIO `gitlab-*` 버킷)를 만든다.
-나중에 GitLab을 켜려면 `INSTALL_GITLAB=true`로 다시 실행하면 된다 (`gitlab` 유저만 추가로 생성됨).
+`INSTALL_GITLAB=true`일 때만 GitLab용 리소스(PostgreSQL `gitlab` 유저/DB, Garage `gitlab` 키와 `gitlab-*` 버킷)를 만든다.
+나중에 GitLab을 켜려면 `INSTALL_GITLAB=true`로 다시 실행하면 된다 (`gitlab` 유저, 키, 버킷만 추가로 생성됨).
 
 ## 설치 순서
 
@@ -21,7 +21,7 @@ INSTALL_GITLAB=true ./bootstrap/01-data.sh
 |:---:|---------|:----:|------|
 | 1 | PostgreSQL 18 | 5432 | 서비스 DB (+ GitLab DB) |
 | 2 | Valkey | 6379 | 캐시, 큐, 세션 |
-| 3 | MinIO | 9000/9001 | 오브젝트 스토리지 |
+| 3 | Garage | 3900 (S3), 3903 (admin) | S3 호환 오브젝트 스토리지 |
 | 4 | OpenBao | 8200 | 시크릿 관리 |
 | 5 | TLS 인증서 | — | Tailscale cert 발급 |
 
@@ -67,19 +67,40 @@ brew services start valkey
 valkey-cli ping   # → PONG
 ```
 
-## 3. MinIO
+## 3. Garage
 
-S3 호환 오브젝트 스토리지. GitLab 사용 시 artifacts, uploads, packages, registry, LFS, terraform state를 저장한다.
+S3 호환 오브젝트 스토리지 ([Garage](https://garagehq.deuxfleurs.fr/), AGPL-3.0).
+GitLab 사용 시 artifacts, uploads, packages, registry, LFS, terraform state, 백업, Runner 캐시를 저장한다.
 
-> [!WARNING]
-> Homebrew `minio` 포뮬러는 업스트림 저장소가 보관(archived)되어 deprecated 상태다. 추후 대체 스토리지 검토가 필요하다.
+> [!NOTE]
+> 이전에는 MinIO를 썼지만 업스트림 저장소가 보관(archived)되어 Homebrew `minio` 포뮬러가 deprecated 되었다.
+> Garage는 GitLab 차트 문서가 번들 MinIO 대체재로 안내하는 스토리지다.
+> 기존 MinIO 데이터 이전은 [MinIO → Garage 이전](../migrate-minio-to-garage.md) 참고.
 
 ```bash
-brew install minio
-brew install minio/stable/mc
+brew install garage
+brew services start garage   # launchd 등록 — 재부팅 후 자동 시작
 ```
 
-**자동 생성되는 버킷 (`INSTALL_GITLAB=true`일 때):**
+**설정 파일:** `$(brew --prefix)/etc/garage/config.toml` (0600, `brew services`가 이 경로를 사용)
+
+| 항목 | 값 |
+|------|----|
+| 데이터 | `~/.local/share/garage/{meta,data}` |
+| S3 API | `0.0.0.0:3900` (K8s에서 `http://host.docker.internal:3900`) |
+| RPC | `127.0.0.1:3901` (단일 노드라 외부 노출 없음) |
+| Admin API | `127.0.0.1:3903` (`/health`) |
+| 리전 | `garage` |
+| 메타데이터 DB | sqlite + fsync + 6시간 자동 스냅샷 (LMDB는 비정상 종료 시 손상 위험) |
+| 로그 | `$(brew --prefix)/var/log/garage.log` |
+
+설정 파일은 처음 한 번만 만들고 재실행 시 덮어쓰지 않는다 (`rpc_secret`, `admin_token` 유지).
+첫 기동 때 단일 노드 레이아웃(`replication_factor = 1`)을 적용한다.
+
+**GitLab 키와 버킷 (`INSTALL_GITLAB=true`일 때):**
+
+S3 키 `gitlab`을 만들고 아래 버킷에 읽기/쓰기 권한만 준다 (버킷 생성 권한 없음).
+키는 Garage 메타데이터에 저장되므로 재실행해도 새로 만들지 않고, 값은 OpenBao `infra/garage`에 복사된다.
 
 | 버킷 | 용도 |
 |------|------|
@@ -90,14 +111,19 @@ brew install minio/stable/mc
 | gitlab-lfs | Git LFS |
 | gitlab-terraform | Terraform state |
 | gitlab-backups | GitLab 자동 백업 |
+| gitlab-tmp | 백업/복원 임시 파일 |
 | gitlab-runner-cache | Runner CI/CD 캐시 |
 
-**콘솔 접속:** http://localhost:9001 (minioadmin / 설정한 비밀번호)
+**관리:** 웹 콘솔은 없고 `garage` CLI를 쓴다.
 
-MinIO 비밀번호는 최초 실행 시 랜덤 생성되며 자동으로 OpenBao에 저장된다. `02-k8s.sh`가 OpenBao에서 읽어 사용한다.
+```bash
+export GARAGE_CONFIG_FILE=$(brew --prefix)/etc/garage/config.toml
 
-MinIO는 기동할 때마다 같은 root 자격증명이 필요하므로 `~/.config/minio/env`(0600)에도 보관한다.
-재부팅 후 `01-data.sh`를 다시 실행하면 이 파일의 자격증명으로 재기동하며, 패스워드를 새로 만들지 않는다.
+garage status
+garage bucket list
+garage bucket info gitlab-registry
+garage key info gitlab --show-secret
+```
 
 ## 4. OpenBao
 
@@ -122,7 +148,7 @@ Homebrew 설치가 실패하면 GitHub 릴리스의 `openbao_<버전>_darwin_<ar
 | 경로 | 내용 |
 |------|------|
 | `infra/postgresql` | root 유저 + 패스워드 (GitLab 사용 시 gitlab 유저 포함) |
-| `infra/minio` | MinIO root 자격증명 |
+| `infra/garage` | Garage S3 엔드포인트/리전 + `gitlab` 키 (GitLab 사용 시) |
 | `infra/valkey` | Valkey 접속 정보 |
 | `infra/argocd` | Argo CD admin 비밀번호 (`02-k8s.sh`가 저장) |
 | `infra/gitlab` | GitLab root 비밀번호 (`02-k8s.sh`, GitLab 사용 시) |
@@ -136,7 +162,7 @@ export BAO_ADDR=http://127.0.0.1:8200
 export BAO_TOKEN=$(python3 -c "import json; print(json.load(open('$HOME/.local/share/openbao/init-keys.json'))['root_token'])")
 
 bao kv list infra/
-bao kv get infra/minio
+bao kv get infra/garage
 ```
 
 ## 5. TLS 인증서
@@ -168,8 +194,8 @@ psql -d postgres -c "SELECT version();"
 # Valkey
 valkey-cli ping
 
-# MinIO
-curl -s http://localhost:9000/minio/health/live
+# Garage
+curl -s http://127.0.0.1:3903/health
 
 # OpenBao
 curl -s http://127.0.0.1:8200/v1/sys/seal-status | python3 -m json.tool
