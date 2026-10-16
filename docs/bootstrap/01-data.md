@@ -86,6 +86,9 @@ brew install minio/stable/mc
 
 MinIO 비밀번호는 최초 실행 시 랜덤 생성되며 자동으로 OpenBao에 저장된다. `02-k8s.sh`가 OpenBao에서 읽어 사용한다.
 
+MinIO는 기동할 때마다 같은 root 자격증명이 필요하므로 `~/.config/minio/env`(0600)에도 보관한다.
+재부팅 후 `01-data.sh`를 다시 실행하면 이 파일의 자격증명으로 재기동하며, 패스워드를 새로 만들지 않는다.
+
 ## 4. OpenBao
 
 HashiCorp Vault 호환 오픈소스 시크릿 관리 (Linux Foundation, MPL 2.0).
@@ -135,8 +138,11 @@ Tailscale의 `tailscale cert` 명령으로 Let's Encrypt 정식 인증서를 발
 
 **갱신 cron:** 격월 1일 03:00에 자동 갱신 + K8s Secret 업데이트
 
+cron의 PATH에는 Homebrew 경로가 없으므로 `tailscale`/`kubectl`은 등록 시점의 절대경로로 기록된다.
+
 ```bash
 crontab -l | grep tailscale
+cat ~/.local/share/tailscale-certs/renew.log   # 갱신 로그
 ```
 
 ## 완료 후 상태 확인

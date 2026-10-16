@@ -31,8 +31,7 @@ step() { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 # ── ⓪ macOS 서버 설정 ──
 step "macOS 서버 설정"
 
-REMOTE_LOGIN=$(sudo systemsetup -getremotelogin 2>/dev/null | grep -c "On" || echo "0")
-if [ "$REMOTE_LOGIN" = "0" ]; then
+if ! sudo systemsetup -getremotelogin 2>/dev/null | grep -q "On"; then
   warn "원격 로그인 활성화"
   sudo systemsetup -setremotelogin on
 fi
@@ -45,8 +44,7 @@ if [ "${SLEEP_VAL:-1}" != "0" ]; then
 fi
 log "잠자기 방지 설정됨"
 
-AUTORESTART=$(pmset -g | grep -c "autorestart.*1" || echo "0")
-if [ "$AUTORESTART" = "0" ]; then
+if ! pmset -g | grep -q "autorestart.*1"; then
   sudo pmset -a autorestart 1
 fi
 log "전원 복구 시 자동 시작 설정됨"
@@ -159,6 +157,21 @@ else
   kubectl cluster-info &>/dev/null || err "K8s 활성화 확인 실패"
   log "K8s 활성화 확인 완료"
 fi
+
+# Tailscale 경유 접근(K8s API :26443, LoadBalancer 서비스)은 외부 노출이 켜져 있어야 함
+if [ "$(orbctl config get k8s.expose_services 2>/dev/null)" != "true" ]; then
+  warn "k8s.expose_services 비활성화 — 활성화 후 OrbStack 재시작"
+  orbctl config set k8s.expose_services true || err "k8s.expose_services 설정 실패"
+  orbctl stop && orbctl start || err "OrbStack 재시작 실패"
+  echo -n "K8s 재기동 대기 중... "
+  for _ in $(seq 1 60); do
+    kubectl cluster-info &>/dev/null && break
+    sleep 2
+  done
+  kubectl cluster-info &>/dev/null || err "OrbStack 재시작 후 K8s 연결 실패"
+  echo "OK"
+fi
+log "k8s.expose_services 활성화됨"
 
 # ── ④ Tailscale ──
 step "Tailscale"

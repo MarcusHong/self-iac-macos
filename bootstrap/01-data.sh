@@ -29,9 +29,16 @@ PG_VERSION="18"
 MINIO_ROOT_USER="minioadmin"
 MINIO_ROOT_PASS=""
 MINIO_DATA_DIR="$HOME/.local/share/minio"
+MINIO_CONFIG_DIR="$HOME/.config/minio"
+MINIO_ENV_FILE="$MINIO_CONFIG_DIR/env"
 OPENBAO_DATA_DIR="$HOME/.local/share/openbao"
 OPENBAO_CONFIG_DIR="$HOME/.config/openbao"
 CERT_DIR="$HOME/.local/share/tailscale-certs"
+
+# MinIO는 기동할 때마다 같은 root 자격증명이 필요하므로 파일(0600)에 보관
+write_minio_env() {
+    (umask 077; printf 'MINIO_ROOT_USER=%s\nMINIO_ROOT_PASSWORD=%s\n' "$MINIO_ROOT_USER" "$MINIO_ROOT_PASS" > "$MINIO_ENV_FILE")
+}
 
 step "1/7 사전 체크"
 
@@ -81,7 +88,8 @@ log "Tailscale: ${TS_HOSTNAME}"
 
 step "2/7 PostgreSQL ${PG_VERSION}"
 
-if ! command -v psql &>/dev/null; then
+# keg-only 포뮬러라 psql 존재 여부가 아닌 설치 여부로 확인
+if ! brew list postgresql@${PG_VERSION} &>/dev/null; then
     echo "  PostgreSQL ${PG_VERSION} 설치 중..."
     brew install postgresql@${PG_VERSION}
 fi
@@ -264,12 +272,25 @@ if ! command -v mc &>/dev/null; then
     brew install minio/stable/mc
 fi
 
-mkdir -p "$MINIO_DATA_DIR"
+mkdir -p "$MINIO_DATA_DIR" "$MINIO_CONFIG_DIR"
+
+# 재실행(재부팅 후 등) 시 저장된 자격증명을 재사용 — 새로 생성하면 OpenBao/K8s Secret과 어긋남
+if [ -f "$MINIO_ENV_FILE" ]; then
+    source "$MINIO_ENV_FILE"
+    MINIO_ROOT_PASS="${MINIO_ROOT_PASSWORD:-}"
+fi
 
 if curl -sf http://localhost:9000/minio/health/live &>/dev/null; then
     log "MinIO 이미 실행 중 — localhost:9000 (콘솔: 9001)"
 else
-    MINIO_ROOT_PASS=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32)
+    if [ -z "$MINIO_ROOT_PASS" ]; then
+        if [ -d "$MINIO_DATA_DIR/.minio.sys" ]; then
+            warn "기존 MinIO 데이터가 있지만 자격증명 파일이 없음 — 새 패스워드로 기동 (완료 후 02-k8s.sh 재실행 필요)"
+        fi
+        MINIO_ROOT_PASS=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32)
+        write_minio_env
+        log "MinIO 자격증명 생성 — ${MINIO_ENV_FILE}"
+    fi
     MINIO_ROOT_USER="$MINIO_ROOT_USER" \
     MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASS" \
     nohup minio server "$MINIO_DATA_DIR" \
@@ -281,7 +302,7 @@ else
     log "MinIO 시작됨 — localhost:9000 (콘솔: 9001)"
 fi
 
-# 버킷 생성은 비밀번호가 있을 때만 (재실행 시 OpenBao에서 읽은 뒤 수행)
+# 버킷 생성은 비밀번호를 알 때만 (자격증명 파일이 없는 이전 설치는 OpenBao 단계에서 파일을 복원)
 if [ -n "$MINIO_ROOT_PASS" ]; then
     mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASS" 2>/dev/null || true
     for bucket in gitlab-artifacts gitlab-uploads gitlab-packages gitlab-registry gitlab-lfs gitlab-terraform gitlab-backups gitlab-runner-cache; do
@@ -289,7 +310,7 @@ if [ -n "$MINIO_ROOT_PASS" ]; then
     done
     log "MinIO 버킷 생성 완료"
 else
-    log "MinIO 이미 실행 중 — 버킷 생성은 OpenBao 로드 후 수행"
+    log "MinIO 이미 실행 중 — 자격증명 파일 없음, 버킷 생성 건너뜀"
 fi
 
 step "5/7 OpenBao"
@@ -462,10 +483,18 @@ if [ -n "${ROOT_TOKEN:-}" ]; then
     fi
 
     if [ -n "$MINIO_ROOT_PASS" ]; then
-        bao kv put infra/minio \
-            root_user="$MINIO_ROOT_USER" \
-            root_password="$MINIO_ROOT_PASS" 2>/dev/null || true
-    elif ! bao kv get infra/minio &>/dev/null; then
+        # 매 실행마다 같은 값이면 새 버전을 만들지 않음
+        if [ "$(bao kv get -field=root_password infra/minio 2>/dev/null)" != "$MINIO_ROOT_PASS" ]; then
+            bao kv put infra/minio \
+                root_user="$MINIO_ROOT_USER" \
+                root_password="$MINIO_ROOT_PASS" 2>/dev/null || true
+        fi
+    elif MINIO_ROOT_PASS=$(bao kv get -field=root_password infra/minio 2>/dev/null) && [ -n "$MINIO_ROOT_PASS" ]; then
+        # 자격증명 파일 도입 이전 설치: OpenBao 값으로 파일 복원
+        MINIO_ROOT_USER=$(bao kv get -field=root_user infra/minio 2>/dev/null || echo "$MINIO_ROOT_USER")
+        write_minio_env
+        log "MinIO 자격증명 파일 복원 (OpenBao infra/minio) — ${MINIO_ENV_FILE}"
+    else
         warn "MinIO 비밀번호를 알 수 없음 — MinIO 데이터를 삭제하고 재실행하세요"
     fi
 
@@ -517,13 +546,17 @@ fi
 
 step "7/7 인증서 갱신 cron"
 
-CRON_CMD="0 3 1 */2 * tailscale cert --cert-file ${CERT_DIR}/${TS_HOSTNAME}.crt --key-file ${CERT_DIR}/${TS_HOSTNAME}.key ${TS_HOSTNAME} && kubectl -n traefik create secret tls tailscale-tls --cert=${CERT_DIR}/${TS_HOSTNAME}.crt --key=${CERT_DIR}/${TS_HOSTNAME}.key --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null"
+# cron의 PATH는 /usr/bin:/bin 뿐이므로 절대경로 사용
+TAILSCALE_BIN=$(command -v tailscale)
+KUBECTL_BIN=$(command -v kubectl)
+CRON_CMD="0 3 1 */2 * { ${TAILSCALE_BIN} cert --cert-file ${CERT_DIR}/${TS_HOSTNAME}.crt --key-file ${CERT_DIR}/${TS_HOSTNAME}.key ${TS_HOSTNAME} && ${KUBECTL_BIN} -n traefik create secret tls tailscale-tls --cert=${CERT_DIR}/${TS_HOSTNAME}.crt --key=${CERT_DIR}/${TS_HOSTNAME}.key --dry-run=client -o yaml | ${KUBECTL_BIN} apply -f -; } >> ${CERT_DIR}/renew.log 2>&1"
 
-if crontab -l 2>/dev/null | grep -q "tailscale cert"; then
+if crontab -l 2>/dev/null | grep -qxF "$CRON_CMD"; then
     log "cron 이미 등록됨"
 else
-    (crontab -l 2>/dev/null; echo "$CRON_CMD") | crontab -
-    log "인증서 갱신 cron 등록 (격월 1일 03:00)"
+    # 기존 항목(PATH 문제로 실패하던 이전 버전 포함)은 교체
+    (crontab -l 2>/dev/null | grep -v "tailscale cert"; echo "$CRON_CMD") | crontab -
+    log "인증서 갱신 cron 등록 (격월 1일 03:00, 로그: ${CERT_DIR}/renew.log)"
 fi
 
 echo ""

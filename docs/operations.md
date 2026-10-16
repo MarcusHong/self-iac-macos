@@ -48,7 +48,7 @@ mc du local/gitlab-registry/
 # 호스트 서비스
 brew services restart postgresql@18
 brew services restart valkey
-# MinIO는 프로세스 kill 후 재시작 필요
+# MinIO는 프로세스 kill 후 ./bootstrap/01-data.sh 재실행 (~/.config/minio/env 자격증명으로 재기동)
 # OpenBao도 프로세스 kill 후 재시작 + unseal 필요
 
 # K8s 워크로드
@@ -88,7 +88,7 @@ pkill -f "bao server"
 
 # 2. 데이터 삭제
 rm -rf ~/.local/share/openbao/raft ~/.local/share/openbao/init-keys.json
-rm -rf ~/.local/share/minio
+rm -rf ~/.local/share/minio ~/.config/minio/env
 
 # 3. K8s 워크로드 삭제
 helm uninstall gitlab -n gitlab

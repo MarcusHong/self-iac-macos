@@ -24,6 +24,7 @@ step() { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+PG_VERSION="18"
 CERT_DIR="$HOME/.local/share/tailscale-certs"
 OPENBAO_DATA_DIR="$HOME/.local/share/openbao"
 
@@ -43,6 +44,9 @@ if ! kubectl cluster-info &>/dev/null; then
 fi
 log "K8s OK"
 
+# postgresql@18은 keg-only라 brew bin에 링크되지 않음 (01-data.sh의 PATH 설정은 이 프로세스에 전달되지 않음)
+export PATH="$(brew --prefix postgresql@${PG_VERSION})/bin:$PATH"
+
 psql -d postgres -c "SELECT 1;" &>/dev/null || err "PostgreSQL 미실행 (01-data.sh 먼저)"
 valkey-cli ping 2>/dev/null | grep -q "PONG" || err "Valkey 미실행"
 curl -sf http://localhost:9000/minio/health/live &>/dev/null || err "MinIO 미실행"
@@ -61,6 +65,11 @@ log "TLS: ${TS_HOSTNAME}"
 GITLAB_HOST="${TS_HOSTNAME}"
 
 export BAO_ADDR="http://127.0.0.1:8200"
+
+# sealed 상태면 kv get이 전부 실패해 빈 값으로 기존 K8s Secret을 덮어쓰게 됨
+SEALED=$(curl -sf "$BAO_ADDR/v1/sys/seal-status" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sealed', True))" 2>/dev/null || echo "True")
+[ "$SEALED" = "True" ] && err "OpenBao가 sealed 상태 — unseal 후 다시 실행하세요 (docs/operations.md 'OpenBao Unseal')"
+
 if [ -f "$OPENBAO_DATA_DIR/init-keys.json" ]; then
     ROOT_TOKEN=$(python3 -c "import json; print(json.load(open('$OPENBAO_DATA_DIR/init-keys.json'))['root_token'])" 2>/dev/null || true)
     export BAO_TOKEN="${ROOT_TOKEN:-}"
@@ -73,6 +82,8 @@ if [ -n "${BAO_TOKEN:-}" ]; then
     MINIO_USER=$(bao kv get -field=root_user infra/minio 2>/dev/null || echo "minioadmin")
     MINIO_PASS=$(bao kv get -field=root_password infra/minio 2>/dev/null || echo "")
     PG_GITLAB_PASS=$(bao kv get -field=gitlab_password infra/postgresql 2>/dev/null || echo "")
+    [ -n "$MINIO_PASS" ] || err "OpenBao에 infra/minio 시크릿 없음 — 01-data.sh를 먼저 실행하세요"
+    [ -n "$PG_GITLAB_PASS" ] || err "OpenBao에 infra/postgresql 시크릿 없음 — 01-data.sh를 먼저 실행하세요"
     log "OpenBao에서 시크릿 로드 (minio, postgresql)"
 else
     err "OpenBao 토큰 없음 — 01-data.sh를 먼저 실행하세요"

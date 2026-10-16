@@ -40,8 +40,11 @@ headless 서버로 운영하기 위한 macOS 설정. 스크립트가 자동 수�
 
 1. Xcode Command Line Tools (Git 포함)
 2. Homebrew
-3. OrbStack (K8s 활성화)
+3. OrbStack (K8s 활성화 + `k8s.expose_services` 활성화 후 재시작)
 4. Tailscale (로그인)
+
+`k8s.expose_services`가 꺼져 있으면 K8s API(:26443)와 LoadBalancer 서비스가 localhost에만 바인딩되어
+Tailscale 경유 접근(`client.sh`, `https://<hostname>.ts.net`)이 불가능하다.
 
 ### 수동 설정 (스크립트 실행 후)
 
@@ -67,11 +70,12 @@ headless 서버로 운영하기 위한 macOS 설정. 스크립트가 자동 수�
 
 ### 자동 수행 내용
 
-1. `k8s.expose_services` 활성화 + OrbStack 재시작
-2. kubeconfig 복사 (`scp`)
-3. server 주소를 Tailscale MagicDNS hostname으로 변경
-4. `insecure-skip-tls-verify` 설정
-5. kubeconfig merge
+1. kubeconfig 복사 (`scp`)
+2. server 주소를 Tailscale MagicDNS hostname으로 변경
+3. `insecure-skip-tls-verify` 설정
+4. kubeconfig merge
+
+`k8s.expose_services`는 서버의 `00-prerequisites.sh`에서 활성화된다.
 
 **TLS 검증 우회가 필요한 이유:**
 OrbStack K8s API 인증서의 SAN에 Tailscale hostname이 포함되지 않는다.
