@@ -44,7 +44,8 @@ if [ "${SLEEP_VAL:-1}" != "0" ]; then
 fi
 log "잠자기 방지 설정됨"
 
-if ! pmset -g | grep -q "autorestart.*1"; then
+# autorestartatconnect 등 비슷한 이름의 항목과 구분하도록 정확히 비교
+if ! pmset -g | grep -qE '^[[:space:]]*autorestart[[:space:]]+1([[:space:]]|$)'; then
   sudo pmset -a autorestart 1
 fi
 log "전원 복구 시 자동 시작 설정됨"
@@ -183,7 +184,16 @@ log "k8s.expose_services 활성화됨"
 # ── ④ Tailscale ──
 step "Tailscale"
 
-if command -v tailscale &>/dev/null; then
+# GUI 앱(standalone/App Store)이 있으면 앱이 노드 역할을 함 — brew tailscaled를 함께 돌리면 충돌
+TS_APP="/Applications/Tailscale.app"
+if [ -d "$TS_APP" ]; then
+  if brew list --formula tailscale &>/dev/null; then
+    warn "Tailscale 앱과 brew tailscale 포뮬러가 함께 설치돼 있음 — 하나만 사용하세요"
+    echo "    앱을 쓰려면: sudo brew services stop tailscale && brew uninstall tailscale"
+  fi
+  command -v tailscale &>/dev/null || err "Tailscale 앱의 CLI가 없습니다 — 앱 Settings에서 CLI를 설치한 뒤 다시 실행하세요"
+  log "Tailscale 앱 사용: $(command -v tailscale)"
+elif command -v tailscale &>/dev/null; then
   log "이미 설치됨"
 else
   warn "설치 시작"
@@ -191,8 +201,8 @@ else
   log "설치 완료"
 fi
 
-# brew 포뮬러는 tailscaled 데몬을 자동으로 시작하지 않음 (root 서비스로 등록 필요)
-if brew list --formula tailscale &>/dev/null; then
+# brew 포뮬러는 tailscaled 데몬을 자동으로 시작하지 않음 (root 서비스로 등록 필요, 앱이 없을 때만)
+if [ ! -d "$TS_APP" ] && brew list --formula tailscale &>/dev/null; then
   if ! sudo brew services info tailscale --json 2>/dev/null \
       | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin)[0].get('running') else 1)" 2>/dev/null; then
     warn "tailscaled 미실행 — 서비스로 시작"
