@@ -243,29 +243,27 @@ step "4/4 Argo CD"
 kubectl create namespace argocd 2>/dev/null || true
 
 # builders-starter-iac와 같은 구성: Argo CD는 Helm으로 설치하고,
-# AppProject·Ingress·서비스 Application은 k8s/에서 직접 적용 (IaC 저장소는 Argo CD source가 아님)
+# AppProject·서비스 Application은 k8s/에서 직접 적용 (IaC 저장소는 Argo CD source가 아님)
+# 비밀번호 없이 익명 admin으로 운영하므로 네트워크에 노출하지 않음 (Ingress 없음, port-forward로 접속)
 helm upgrade --install argocd oci://ghcr.io/argoproj/argo-helm/argo-cd \
     --version "$ARGOCD_CHART_VERSION" \
     --namespace argocd \
     -f "$SCRIPT_DIR/argocd-values.yaml" \
-    --set global.domain="$TS_HOSTNAME" \
-    --set configs.cm.url="https://${TS_HOSTNAME}/argocd" \
     --wait --timeout 10m || err "Argo CD 설치 실패"
 
 log "Argo CD 설치 완료"
 
-TS_HOSTNAME="$TS_HOSTNAME" "$SCRIPT_DIR/../k8s/deploy.sh" || err "k8s/ 플랫폼 매니페스트 적용 실패"
-log "Argo CD UI — https://${TS_HOSTNAME}/argocd"
+# 이전 버전이 만든 /argocd Ingress와 초기 admin 비밀번호 Secret 정리 (k8s/deploy.sh는 prune하지 않음)
+kubectl -n argocd delete ingress argocd-server --ignore-not-found > /dev/null
+kubectl -n argocd delete secret argocd-initial-admin-secret --ignore-not-found > /dev/null
 
-ARGOCD_ADMIN_PW=$(kubectl get secret argocd-initial-admin-secret \
-    -n argocd -ojsonpath='{.data.password}' 2>/dev/null | base64 --decode || echo "")
+"$SCRIPT_DIR/../k8s/deploy.sh" || err "k8s/ 플랫폼 매니페스트 적용 실패"
 
-if [ -n "$ARGOCD_ADMIN_PW" ]; then
-    echo ""
-    echo "  Argo CD admin 비밀번호: ${ARGOCD_ADMIN_PW}"
-    echo "  (argocd-initial-admin-secret에 보관 — 비밀번호를 바꾼 뒤에는 이 Secret을 지워도 됨)"
-    echo ""
-fi
+echo ""
+echo "  Argo CD UI (로그인 없음):"
+echo "    kubectl -n argocd port-forward svc/argocd-server 8080:80   → http://localhost:8080"
+echo "    랩탑에서는 client.sh로 만든 context 사용: kubectl --context=orbstack-remote -n argocd port-forward ..."
+echo "  CLI (로그인 없음): ARGOCD_OPTS=\"--port-forward --port-forward-namespace argocd --plaintext\" argocd app list"
 
 echo ""
 echo "  서비스 배포: 서비스 CI가 *-deploy OCI 아티팩트를 발행하고, 서비스별 Application이 동기화합니다."
@@ -292,6 +290,6 @@ echo "  │  ├─ Traefik   https://${TS_HOSTNAME}"
 if [ "$INSTALL_GITLAB" = "true" ]; then
 echo "  │  ├─ GitLab    https://${GITLAB_HOST}"
 fi
-echo "  │  └─ Argo CD   https://${TS_HOSTNAME}/argocd"
+echo "  │  └─ Argo CD   port-forward → http://localhost:8080"
 echo "  └──────────────────────────────────────────────┘"
 echo ""

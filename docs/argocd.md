@@ -19,8 +19,8 @@ builders-starter-iac와 같은 구성을 따른다. IaC 저장소(이 저장소)
 - **IaC source 미등록**: 이 저장소용 Git/OCI repository Secret이나 root Application을 만들지 않는다.
 - **선택 컴포넌트**: ApplicationSet controller는 replica 0, Dex는 설치하지 않는다.
   Notifications controller는 활성화하지만 notifier와 구독은 별도 설정이다.
-- **노출**: `k8s/infra/argocd-ingress.yaml`이 Traefik으로 `https://<tailscale-hostname>/argocd`를 노출한다
-  (`server.insecure`, `server.rootpath=/argocd`).
+- **인증 없음**: 익명 사용자가 admin 권한을 가지며 admin 계정은 꺼져 있다.
+- **노출 없음**: Ingress가 없고 `kubectl port-forward`로만 접속한다. K8s API에 접근할 수 있는 사람만 쓸 수 있다.
 
 ## 플랫폼 매니페스트 직접 적용
 
@@ -110,14 +110,16 @@ Argo CD는 이동 tag의 digest 변화를 감지한다(`timeout.reconciliation: 
 ## UI / CLI 접근
 
 ```bash
-# 초기 admin 비밀번호 (02-k8s.sh가 설치 직후 한 번 출력)
-kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath='{.data.password}' | base64 -d; echo
+# UI — 로그인 없음 (익명 admin)
+kubectl -n argocd port-forward svc/argocd-server 8080:80
+# → http://localhost:8080
 
-# UI: https://<tailscale-hostname>/argocd
+# 랩탑에서 (client.sh로 만든 context)
+kubectl --context=orbstack-remote -n argocd port-forward svc/argocd-server 8080:80
 
-# CLI
-argocd login <tailscale-hostname> --grpc-web-root-path /argocd --username admin
+# CLI — 내장 port-forward로 접속 (로그인 불필요). ~/.zshrc 등에 두면 argocd app list처럼 바로 사용
+export ARGOCD_OPTS="--port-forward --port-forward-namespace argocd --plaintext"
+argocd app list
 ```
 
 ## 상태 확인
@@ -152,7 +154,7 @@ kubectl -n argocd get application <name> -o jsonpath='{.status.conditions}'
 | OCI `revision not found` | `targetRevision` 태그가 `*-deploy` 저장소에 발행됐는지 |
 | OCI `unauthorized` | `repo-creds` Secret의 url prefix와 자격증명 |
 | 서비스만 `Unknown` | 이미지뿐 아니라 `*-deploy` 아티팩트도 발행했는지 |
-| UI 404 / 리다이렉트 반복 | Ingress host·`/argocd` 경로와 `server.rootpath`/`server.basehref` 일치 여부 |
+| UI 접속 안 됨 | `kubectl -n argocd port-forward svc/argocd-server 8080:80`이 실행 중인지, `argocd-server` 파드 상태 |
 
 ## 롤백
 

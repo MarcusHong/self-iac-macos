@@ -55,7 +55,7 @@ Valkey, kubectl, Helm, Argo CD CLI, Tailscale은 설치 시점의 Homebrew 최�
 │                           │ host.docker.internal      │
 │  ┌─ OrbStack K8s ─────────┴────────────────────────┐  │
 │  │  Traefik        Ingress + TLS                   │  │
-│  │  Argo CD        GitOps (/argocd)                │  │
+│  │  Argo CD        GitOps (port-forward, 익명)      │  │
 │  │  GitLab CE      Runner · Registry  (선택)       │  │
 │  │                 Terraform State                 │  │
 │  └─────────────────────────────────────────────────┘  │
@@ -110,7 +110,6 @@ self-iac/
 │   ├── kustomization.yaml
 │   ├── namespace.yaml         # apps namespace
 │   ├── projects/              # AppProject: platform, apps
-│   ├── infra/                 # Argo CD Ingress (Traefik, /argocd)
 │   ├── services/              # 서비스별 OCI Application
 │   └── _template/service/     # 서비스 등록 템플릿
 │
