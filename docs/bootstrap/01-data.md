@@ -2,6 +2,10 @@
 
 호스트에 네이티브로 설치하는 컴포넌트들. K8s와 독립적으로 운영된다.
 
+**비밀번호 없이 운영한다.** PostgreSQL과 RustFS는 `127.0.0.1`에만 리슨하고, PostgreSQL은 Homebrew 기본
+`pg_hba.conf`(로컬 trust), RustFS는 고정 기본 자격증명(`rustfsadmin`)을 쓴다. 별도 시크릿 저장소는 없다.
+LAN에는 열리지 않지만, 이 Mac의 로컬 프로세스와 OrbStack 컨테이너·파드는 인증 없이 접근할 수 있다.
+
 ## 실행
 
 ```bash
@@ -12,8 +16,8 @@
 INSTALL_GITLAB=true ./bootstrap/01-data.sh
 ```
 
-`INSTALL_GITLAB=true`일 때만 GitLab용 리소스(PostgreSQL `gitlab` 유저/DB, Garage `gitlab` 키와 `gitlab-*` 버킷)를 만든다.
-나중에 GitLab을 켜려면 `INSTALL_GITLAB=true`로 다시 실행하면 된다 (`gitlab` 유저, 키, 버킷만 추가로 생성됨).
+`INSTALL_GITLAB=true`일 때만 GitLab용 리소스(PostgreSQL `gitlab` 유저/DB, RustFS `gitlab-*` 버킷)를 만든다.
+나중에 GitLab을 켜려면 `INSTALL_GITLAB=true`로 다시 실행하면 된다 (`gitlab` 유저/DB와 버킷만 추가로 생성됨).
 
 ## 설치 순서
 
@@ -21,9 +25,8 @@ INSTALL_GITLAB=true ./bootstrap/01-data.sh
 |:---:|---------|:----:|------|
 | 1 | PostgreSQL 18 | 5432 | 서비스 DB (+ GitLab DB) |
 | 2 | Valkey | 6379 | 캐시, 큐, 세션 |
-| 3 | Garage | 3900 (S3), 3903 (admin) | S3 호환 오브젝트 스토리지 |
-| 4 | OpenBao | 8200 | 시크릿 관리 |
-| 5 | TLS 인증서 | — | Tailscale cert 발급 |
+| 3 | RustFS | 9000 (S3), 9001 (콘솔) | S3 호환 오브젝트 스토리지 |
+| 4 | TLS 인증서 | — | Tailscale cert 발급 |
 
 ## 1. PostgreSQL 18
 
@@ -32,29 +35,22 @@ brew install postgresql@18
 brew services start postgresql@18
 ```
 
-관리용 유저가 자동 생성되며, `INSTALL_GITLAB=true`이면 GitLab용 데이터베이스와 유저도 만든다.
+기본 설정 그대로 `localhost`에만 리슨하고, Homebrew가 만든 `pg_hba.conf`(로컬·`127.0.0.1` trust)를 그대로 쓴다.
+관리는 macOS 계정으로 로컬 접속한다 (`psql -d postgres`). 별도 관리용 유저나 비밀번호는 만들지 않는다.
 
-| 유저 | 역할 | 용도 | 생성 조건 |
-|------|------|------|-----------|
-| root | 슈퍼유저 | 관리용 | 항상 |
-| gitlab | 일반 유저 (CREATEDB) | GitLab 전용 | `INSTALL_GITLAB=true` |
-
-패스워드는 `openssl rand`로 32자 랜덤 생성되며, 자동으로 OpenBao에 저장된다.
-`pg_hba.conf`는 `scram-sha-256` 인증으로 설정된다.
+`INSTALL_GITLAB=true`이면 비밀번호 없는 `gitlab` 유저(LOGIN, CREATEDB)와 `gitlab` DB를 만든다.
+GitLab 파드는 `host.docker.internal:5432`로 접속하며, 이 연결은 Mac localhost로 들어와 trust로 인증된다.
 
 **확장 모듈:** `pg_trgm`, `btree_gist` (GitLab DB, `INSTALL_GITLAB=true`일 때)
 
-**네트워크:** `pg_hba.conf`에 Docker/K8s/Tailscale 대역이 추가된다.
-- `10.0.0.0/8` — K8s Pod 네트워크
-- `172.16.0.0/12` — Docker 네트워크
-- `192.168.0.0/16` — 로컬 네트워크
-- `100.64.0.0/10` — Tailscale CGNAT
+**max_connections:** GitLab이 커넥션을 많이 쓰므로 1000으로 올린다.
 
 **확인:**
 
 ```bash
-psql -d postgres -c "SELECT rolname, rolsuper FROM pg_roles WHERE rolname IN ('root', 'gitlab');"
-psql -d gitlab -c "SELECT extname FROM pg_extension;"
+psql -d postgres -c "SHOW listen_addresses;"   # → localhost
+psql -d postgres -c "SELECT rolname FROM pg_roles WHERE rolname = 'gitlab';"
+psql -d gitlab -c "SELECT extname FROM pg_extension;"   # GitLab 사용 시
 ```
 
 ## 2. Valkey
@@ -67,40 +63,45 @@ brew services start valkey
 valkey-cli ping   # → PONG
 ```
 
-## 3. Garage
+## 3. RustFS
 
-S3 호환 오브젝트 스토리지 ([Garage](https://garagehq.deuxfleurs.fr/), AGPL-3.0).
+S3 호환 오브젝트 스토리지 ([RustFS](https://github.com/rustfs/rustfs), Apache-2.0).
 GitLab 사용 시 artifacts, uploads, packages, registry, LFS, terraform state, 백업, Runner 캐시를 저장한다.
 
 > [!NOTE]
 > 이전에는 MinIO를 썼지만 업스트림 저장소가 보관(archived)되어 Homebrew `minio` 포뮬러가 deprecated 되었다.
-> Garage는 GitLab 차트 문서가 번들 MinIO 대체재로 안내하는 스토리지다.
-> 기존 MinIO 데이터 이전은 [MinIO → Garage 이전](../migrate-minio-to-garage.md) 참고.
+> 기존 MinIO 데이터 이전은 [MinIO → RustFS 이전](../migrate-minio-to-rustfs.md) 참고.
 
-```bash
-brew install garage
-brew services start garage   # launchd 등록 — 재부팅 후 자동 시작
-```
-
-**설정 파일:** `$(brew --prefix)/etc/garage/config.toml` (0600, `brew services`가 이 경로를 사용)
+**설치:** Homebrew core에 없고, 공식 tap(`rustfs/tap/rustfs`)은 항상 최신 버전으로 올라가 버전을 고정할 수 없다.
+그래서 GitHub 릴리스의 `rustfs-macos-aarch64-v<버전>.zip`을 받아 SHA-256을 확인한 뒤 설치한다 (Apple Silicon만 지원).
 
 | 항목 | 값 |
 |------|----|
-| 데이터 | `~/.local/share/garage/{meta,data}` |
-| S3 API | `0.0.0.0:3900` (K8s에서 `http://host.docker.internal:3900`) |
-| RPC | `127.0.0.1:3901` (단일 노드라 외부 노출 없음) |
-| Admin API | `127.0.0.1:3903` (`/health`) |
-| 리전 | `garage` |
-| 메타데이터 DB | sqlite + fsync + 6시간 자동 스냅샷 (LMDB는 비정상 종료 시 손상 위험) |
-| 로그 | `$(brew --prefix)/var/log/garage.log` |
+| 버전 | 1.0.3 (`01-data.sh`의 `RUSTFS_VERSION`, `RUSTFS_SHA256`) |
+| 바이너리 | `~/.local/opt/rustfs/<버전>/rustfs` |
+| 데이터 | `~/.local/share/rustfs/data` (단일 디스크) |
+| 자격증명 | 고정 기본값 `rustfsadmin` / `rustfsadmin` (`RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`) |
+| S3 API | `127.0.0.1:9000` (K8s에서 `http://host.docker.internal:9000`) |
+| 콘솔 | `127.0.0.1:9001/rustfs/console/` |
+| 리전 | `us-east-1` |
+| 로그 | `~/.local/share/rustfs/rustfs.log` (JSON, 회전 없음) |
+| 기동 | LaunchAgent `~/Library/LaunchAgents/local.self-iac.rustfs.plist` (RunAtLoad, KeepAlive) |
 
-설정 파일은 처음 한 번만 만들고 재실행 시 덮어쓰지 않는다 (`rpc_secret`, `admin_token` 유지).
-첫 기동 때 단일 노드 레이아웃(`replication_factor = 1`)을 적용한다.
+**localhost 바인딩:** S3 API와 콘솔은 `127.0.0.1`에만 리슨한다. OrbStack 컨테이너와 K8s 파드에서
+`host.docker.internal`(0.250.250.254)로 접속하면 Mac의 localhost 리스너에 연결된다.
+OrbStack 문서에는 Docker/K8s에 대한 명시가 없어(Linux 머신은 localhost 접속 미지원으로 명시) 이 서버에서
+`127.0.0.1`에만 바인딩한 RustFS에 Docker 컨테이너와 K8s 파드로 `/health` 200을 확인했다.
+OrbStack 업데이트 후 GitLab이 오브젝트 스토리지에 연결하지 못하면 이 부분부터 확인한다 ([운영](../operations.md) 트러블슈팅).
 
-**GitLab 키와 버킷 (`INSTALL_GITLAB=true`일 때):**
+**자동 기동:** LaunchAgent는 로그인 세션에서 실행되므로 PostgreSQL/Valkey(`brew services`)와 마찬가지로
+서버에 자동 로그인이 설정되어 있어야 재부팅 후 올라온다. 프로세스가 죽으면 launchd가 바로 다시 띄운다.
+버전이나 옵션을 바꾸고 `01-data.sh`를 다시 실행하면 plist를 새로 쓰고 에이전트를 다시 등록한다.
 
-S3 키 `gitlab`을 만들고 아래 버킷에 읽기/쓰기 권한만 준다 (버킷 생성 권한 없음).
-키는 Garage 메타데이터에 저장되므로 재실행해도 새로 만들지 않고, 값은 OpenBao `infra/garage`에 복사된다.
+**자격증명:** localhost 전용이므로 비밀번호를 생성·보관하지 않고 고정 기본값(`rustfsadmin`/`rustfsadmin`)으로
+기동한다 (plist의 `--access-key`/`--secret-key`). `02-k8s.sh`도 같은 값으로 GitLab용 Secret을 만든다.
+기동 후 이 값으로 서명한 요청이 200을 받는지 확인하며, 다른 키로 초기화된 이전 데이터가 있으면 중단한다.
+
+**자동 생성되는 버킷 (`INSTALL_GITLAB=true`일 때):**
 
 | 버킷 | 용도 |
 |------|------|
@@ -114,71 +115,9 @@ S3 키 `gitlab`을 만들고 아래 버킷에 읽기/쓰기 권한만 준다 (�
 | gitlab-tmp | 백업/복원 임시 파일 |
 | gitlab-runner-cache | Runner CI/CD 캐시 |
 
-**관리:** 웹 콘솔은 없고 `garage` CLI를 쓴다.
+버킷은 별도 클라이언트 없이 `curl --aws-sigv4`로 만든다. 관리 명령은 [운영 가이드](../operations.md#rustfs-오브젝트-스토리지) 참고.
 
-```bash
-export GARAGE_CONFIG_FILE=$(brew --prefix)/etc/garage/config.toml
-
-garage status
-garage bucket list
-garage bucket info gitlab-registry
-garage key info gitlab --show-secret
-```
-
-## 4. OpenBao
-
-HashiCorp Vault 호환 오픈소스 시크릿 관리 (Linux Foundation, MPL 2.0).
-
-```bash
-brew install openbao
-```
-
-Homebrew 설치가 실패하면 GitHub 릴리스의 `openbao_<버전>_darwin_<arch>.tar.gz`(기본 2.7.1, `OPENBAO_VERSION`)를 받아 설치한다.
-
-**초기화:** 스크립트가 자동으로 초기화하고 Unseal Key + Root Token을 발급한다.
-
-```
-~/.local/share/openbao/init-keys.json
-```
-
-**이 파일을 반드시 별도로 백업할 것.** 분실 시 OpenBao의 모든 시크릿에 접근 불가.
-
-**자동 저장되는 시크릿:**
-
-| 경로 | 내용 |
-|------|------|
-| `infra/postgresql` | root 유저 + 패스워드 (GitLab 사용 시 gitlab 유저 포함) |
-| `infra/garage` | Garage S3 엔드포인트/리전 + `gitlab` 키 (GitLab 사용 시) |
-| `infra/valkey` | Valkey 접속 정보 |
-| `infra/argocd` | Argo CD admin 비밀번호 (`02-k8s.sh`가 저장) |
-| `infra/gitlab` | GitLab root 비밀번호 (`02-k8s.sh`, GitLab 사용 시) |
-
-**UI 접속:** http://localhost:8200/ui (Root Token으로 로그인)
-
-OpenBao는 TLS 없이 동작하므로 `127.0.0.1:8200`에만 바인딩한다. 랩탑에서는 SSH 터널로 접속한다.
-
-```bash
-ssh -L 8200:127.0.0.1:8200 <user>@<server>
-# → http://localhost:8200/ui
-```
-
-이전 버전(0.0.0.0 바인딩)으로 실행 중이면 `01-data.sh`가 재시작 후 `init-keys.json`으로 자동 unseal한다.
-
-**저장 실패 처리:** unseal 실패, `infra/` KV 마운트 누락, 시크릿 저장 실패 시 스크립트가 중단된다.
-PostgreSQL 패스워드는 OpenBao 저장보다 먼저 적용되므로, 저장 단계에서 중단되면 원인을 해결한 뒤
-다시 실행해 패스워드 재생성(Y)을 선택한다.
-
-**CLI 사용:**
-
-```bash
-export BAO_ADDR=http://127.0.0.1:8200
-export BAO_TOKEN=$(python3 -c "import json; print(json.load(open('$HOME/.local/share/openbao/init-keys.json'))['root_token'])")
-
-bao kv list infra/
-bao kv get infra/garage
-```
-
-## 5. TLS 인증서
+## 4. TLS 인증서
 
 Tailscale의 `tailscale cert` 명령으로 Let's Encrypt 정식 인증서를 발급받는다.
 발급 실패 시 Tailscale Admin Console 설정 안내와 함께 재시도 프롬프트가 나타난다.
@@ -207,11 +146,8 @@ psql -d postgres -c "SELECT version();"
 # Valkey
 valkey-cli ping
 
-# Garage
-curl -s http://127.0.0.1:3903/health
-
-# OpenBao
-curl -s http://127.0.0.1:8200/v1/sys/seal-status | python3 -m json.tool
+# RustFS
+curl -s http://127.0.0.1:9000/health
 
 # TLS
 ls ~/.local/share/tailscale-certs/

@@ -71,7 +71,7 @@ cp -R k8s/_template/service k8s/services/api
 ### 2. private 레지스트리 pull 인증
 
 repository Secret에는 자격증명을 넣지 않는다. private 레지스트리(GitLab Container Registry, ghcr 등)는
-URL prefix로 매칭되는 `repo-creds` Secret을 따로 만든다. 자격증명은 Git에 커밋하지 말고 OpenBao에 보관한다.
+URL prefix로 매칭되는 `repo-creds` Secret을 따로 만든다. 자격증명은 Git에 커밋하지 않는다.
 
 ```bash
 kubectl -n argocd create secret generic repo-creds-<registry> \
@@ -110,7 +110,7 @@ Argo CD는 이동 tag의 digest 변화를 감지한다(`timeout.reconciliation: 
 ## UI / CLI 접근
 
 ```bash
-# 초기 admin 비밀번호 (02-k8s.sh가 OpenBao infra/argocd에도 저장)
+# 초기 admin 비밀번호 (02-k8s.sh가 설치 직후 한 번 출력)
 kubectl -n argocd get secret argocd-initial-admin-secret \
   -o jsonpath='{.data.password}' | base64 -d; echo
 

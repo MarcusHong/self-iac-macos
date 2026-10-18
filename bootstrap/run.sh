@@ -5,7 +5,7 @@ set -uo pipefail
 # self-iac 전체 순차 실행
 #
 #   00 → Prerequisites (Xcode CLT, Homebrew, OrbStack, Tailscale)
-#   01 → Data (PostgreSQL, Valkey, Garage, OpenBao, TLS)
+#   01 → Data (PostgreSQL, Valkey, RustFS, TLS)
 #   02 → K8s  (Traefik, GitLab, Argo CD)
 #
 # GitLab은 선택 사항 (기본값: false)

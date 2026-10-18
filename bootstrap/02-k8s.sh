@@ -32,7 +32,14 @@ INSTALL_GITLAB="${INSTALL_GITLAB:-false}"
 
 PG_VERSION="18"
 CERT_DIR="$HOME/.local/share/tailscale-certs"
-OPENBAO_DATA_DIR="$HOME/.local/share/openbao"
+
+# 호스트 서비스는 localhost 전용이라 비밀번호 없이 운영 (01-data.sh와 같은 값)
+S3_ENDPOINT="http://host.docker.internal:9000"   # RustFS — 파드의 host.docker.internal은 Mac localhost로 연결됨
+S3_REGION="us-east-1"
+S3_ACCESS_KEY="rustfsadmin"
+S3_SECRET_KEY="rustfsadmin"
+# PostgreSQL은 로컬 trust라 비밀번호를 검사하지 않음 — GitLab 차트가 Secret을 요구해서 자리 표시 값만 넣음
+PG_GITLAB_PASS="unused-trust-auth"
 
 # Helm 차트 버전 (고정)
 TRAEFIK_CHART_VERSION="42.0.0"   # Traefik v3.7.14
@@ -56,9 +63,8 @@ if [ "$INSTALL_GITLAB" = "true" ]; then
 
     psql -d postgres -c "SELECT 1;" &>/dev/null || err "PostgreSQL 미실행 (01-data.sh 먼저)"
     valkey-cli ping 2>/dev/null | grep -q "PONG" || err "Valkey 미실행"
-    curl -sf http://127.0.0.1:3903/health &>/dev/null || err "Garage 미실행 또는 비정상 (01-data.sh 먼저)"
+    curl -sf http://127.0.0.1:9000/health &>/dev/null || err "RustFS 미실행 (01-data.sh 먼저)"
 fi
-curl -sf http://127.0.0.1:8200/v1/sys/seal-status &>/dev/null || err "OpenBao 미실행"
 log "호스트 데이터 레이어 OK"
 
 TS_HOSTNAME=""
@@ -71,34 +77,6 @@ if [ -z "$TS_HOSTNAME" ]; then
 fi
 log "TLS: ${TS_HOSTNAME}"
 GITLAB_HOST="${TS_HOSTNAME}"
-
-export BAO_ADDR="http://127.0.0.1:8200"
-
-# sealed 상태면 kv get이 전부 실패해 빈 값으로 기존 K8s Secret을 덮어쓰게 됨
-SEALED=$(curl -sf "$BAO_ADDR/v1/sys/seal-status" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sealed', True))" 2>/dev/null || echo "True")
-[ "$SEALED" = "True" ] && err "OpenBao가 sealed 상태 — unseal 후 다시 실행하세요 (docs/operations.md 'OpenBao Unseal')"
-
-if [ -f "$OPENBAO_DATA_DIR/init-keys.json" ]; then
-    ROOT_TOKEN=$(python3 -c "import json; print(json.load(open('$OPENBAO_DATA_DIR/init-keys.json'))['root_token'])" 2>/dev/null || true)
-    export BAO_TOKEN="${ROOT_TOKEN:-}"
-fi
-[ -n "${BAO_TOKEN:-}" ] || err "OpenBao 토큰 없음 — 01-data.sh를 먼저 실행하세요"
-
-S3_ENDPOINT=""
-S3_REGION=""
-S3_ACCESS_KEY=""
-S3_SECRET_KEY=""
-PG_GITLAB_PASS=""
-if [ "$INSTALL_GITLAB" = "true" ]; then
-    S3_ENDPOINT=$(bao kv get -field=endpoint infra/garage 2>/dev/null || echo "http://host.docker.internal:3900")
-    S3_REGION=$(bao kv get -field=region infra/garage 2>/dev/null || echo "garage")
-    S3_ACCESS_KEY=$(bao kv get -field=gitlab_access_key infra/garage 2>/dev/null || echo "")
-    S3_SECRET_KEY=$(bao kv get -field=gitlab_secret_key infra/garage 2>/dev/null || echo "")
-    PG_GITLAB_PASS=$(bao kv get -field=gitlab_password infra/postgresql 2>/dev/null || echo "")
-    [ -n "$S3_ACCESS_KEY" ] && [ -n "$S3_SECRET_KEY" ] || err "OpenBao에 infra/garage GitLab 키 없음 — INSTALL_GITLAB=true ./bootstrap/01-data.sh 먼저"
-    [ -n "$PG_GITLAB_PASS" ] || err "OpenBao에 infra/postgresql gitlab 패스워드 없음 — INSTALL_GITLAB=true ./bootstrap/01-data.sh 먼저"
-    log "OpenBao에서 시크릿 로드 (garage, postgresql)"
-fi
 
 step "2/4 Traefik"
 
@@ -131,8 +109,9 @@ else
         --from-literal=password="${PG_GITLAB_PASS}" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-    # ── 오브젝트 스토리지 시크릿 (호스트 Garage) ──
-    # 형식은 GitLab 차트 문서의 Garage 예시를 따름 (docs.gitlab.com/charts/installation/migration/bundled_chart_migration)
+    # ── 오브젝트 스토리지 시크릿 (호스트 RustFS) ──
+    # 형식은 GitLab 차트 문서의 외부 S3 예시를 따름 (docs.gitlab.com/charts/installation/migration/bundled_chart_migration)
+    # RustFS는 127.0.0.1에만 리슨하지만 OrbStack 파드의 host.docker.internal은 Mac localhost로 연결됨
     S3_HOSTPORT="${S3_ENDPOINT#*://}"
 
     # Rails/Workhorse (fog) 연결
@@ -246,9 +225,6 @@ EOF
     echo "  GitLab root 비밀번호: ${GITLAB_ROOT_PW}"
     echo ""
 
-    bao kv put infra/gitlab root_password="$GITLAB_ROOT_PW" 2>/dev/null || true
-    log "GitLab 비밀번호 → OpenBao 저장"
-
     echo -n "  GitLab 응답 대기"
     for i in $(seq 1 60); do
         if curl -sfk "https://${GITLAB_HOST}/-/readiness" > /dev/null 2>&1; then
@@ -287,9 +263,8 @@ ARGOCD_ADMIN_PW=$(kubectl get secret argocd-initial-admin-secret \
 if [ -n "$ARGOCD_ADMIN_PW" ]; then
     echo ""
     echo "  Argo CD admin 비밀번호: ${ARGOCD_ADMIN_PW}"
+    echo "  (argocd-initial-admin-secret에 보관 — 비밀번호를 바꾼 뒤에는 이 Secret을 지워도 됨)"
     echo ""
-    bao kv put infra/argocd admin_password="$ARGOCD_ADMIN_PW" 2>/dev/null || true
-    log "Argo CD 비밀번호 → OpenBao 저장"
 fi
 
 echo ""
@@ -310,8 +285,7 @@ echo "  ┌───────────────────────
 echo "  │  호스트                                        │"
 echo "  │  ├─ PostgreSQL 18  localhost:5432            │"
 echo "  │  ├─ Valkey         localhost:6379            │"
-echo "  │  ├─ Garage (S3)    localhost:3900            │"
-echo "  │  └─ OpenBao        localhost:8200/ui         │"
+echo "  │  └─ RustFS (S3)    localhost:9000            │"
 echo "  │                                              │"
 echo "  │  K8s                                         │"
 echo "  │  ├─ Traefik   https://${TS_HOSTNAME}"

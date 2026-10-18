@@ -1,6 +1,6 @@
 # ================================================
 # GitLab CE Helm Values (chart 10.5.0 / GitLab 19.5.0)
-# 호스트 PostgreSQL 18 + Valkey + Garage(S3)
+# 호스트 PostgreSQL 18 + Valkey + RustFS(S3)
 # INSTALL_GITLAB=true 일 때만 02-k8s.sh가 사용
 # ================================================
 
@@ -74,7 +74,7 @@ global:
   appConfig:
     applicationSettingsCacheSeconds: 60
 
-    # ── 오브젝트 스토리지 (호스트 Garage, Secret은 02-k8s.sh가 생성) ──
+    # ── 오브젝트 스토리지 (호스트 RustFS, Secret은 02-k8s.sh가 생성) ──
     # host.docker.internal은 클러스터 밖(브라우저, git-lfs)에서 접근할 수 없으므로 다운로드는 GitLab이 프록시
     object_store:
       enabled: true
@@ -131,9 +131,9 @@ gitlab-runner:
           Type = "s3"
           Shared = true
           [runners.cache.s3]
-            ServerAddress = "host.docker.internal:3900"
+            ServerAddress = "host.docker.internal:9000"
             BucketName = "gitlab-runner-cache"
-            BucketLocation = "garage"
+            BucketLocation = "us-east-1"
             Insecure = true
             AuthenticationType = "access-key"
 
