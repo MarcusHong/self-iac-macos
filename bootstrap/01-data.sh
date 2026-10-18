@@ -9,7 +9,7 @@ set -uo pipefail
 #   ③ Valkey
 #   ④ RustFS (S3 오브젝트 스토리지)
 #   ⑤ Tailscale TLS 인증서
-#   ⑥ 인증서 갱신 cron
+#   ⑥ 인증서 자동 갱신 (launchd)
 #
 # 비밀번호 없이 운영한다: PostgreSQL·RustFS 모두 localhost에만 리슨하고
 # PostgreSQL은 로컬 trust, RustFS는 고정 기본 자격증명을 쓴다.
@@ -344,19 +344,80 @@ else
     done
 fi
 
-step "6/6 인증서 갱신 cron"
+step "6/6 인증서 자동 갱신 (launchd)"
 
-# cron의 PATH는 /usr/bin:/bin 뿐이므로 절대경로 사용
+# crontab은 수정할 때 macOS 관리 권한 창을 띄우므로 RustFS처럼 LaunchAgent 예약 실행으로 등록
+# LaunchAgent 환경의 PATH에는 Homebrew 경로가 없으므로 절대경로를 스크립트에 기록
 TAILSCALE_BIN=$(command -v tailscale)
 KUBECTL_BIN=$(command -v kubectl)
-CRON_CMD="0 3 1 */2 * { ${TAILSCALE_BIN} cert --cert-file ${CERT_DIR}/${TS_HOSTNAME}.crt --key-file ${CERT_DIR}/${TS_HOSTNAME}.key ${TS_HOSTNAME} && ${KUBECTL_BIN} -n traefik create secret tls tailscale-tls --cert=${CERT_DIR}/${TS_HOSTNAME}.crt --key=${CERT_DIR}/${TS_HOSTNAME}.key --dry-run=client -o yaml | ${KUBECTL_BIN} apply -f -; } >> ${CERT_DIR}/renew.log 2>&1"
+RENEW_SCRIPT="${CERT_DIR}/renew.sh"
+RENEW_LABEL="local.self-iac.cert-renew"
+RENEW_PLIST="$HOME/Library/LaunchAgents/${RENEW_LABEL}.plist"
+RENEW_DOMAIN="gui/$(id -u)"
 
-if crontab -l 2>/dev/null | grep -qxF "$CRON_CMD"; then
-    log "cron 이미 등록됨"
-else
-    # 기존 항목(PATH 문제로 실패하던 이전 버전 포함)은 교체
-    (crontab -l 2>/dev/null | grep -v "tailscale cert"; echo "$CRON_CMD") | crontab -
-    log "인증서 갱신 cron 등록 (격월 1일 03:00, 로그: ${CERT_DIR}/renew.log)"
+cat > "$RENEW_SCRIPT" << EOF
+#!/bin/bash
+# 01-data.sh가 생성 — Tailscale 인증서를 갱신하고 Traefik TLS Secret을 업데이트
+set -uo pipefail
+echo "== \$(date '+%F %T')"
+"${TAILSCALE_BIN}" cert --cert-file "${CERT_DIR}/${TS_HOSTNAME}.crt" --key-file "${CERT_DIR}/${TS_HOSTNAME}.key" "${TS_HOSTNAME}" || exit 1
+"${KUBECTL_BIN}" -n traefik create secret tls tailscale-tls \\
+    --cert="${CERT_DIR}/${TS_HOSTNAME}.crt" --key="${CERT_DIR}/${TS_HOSTNAME}.key" \\
+    --dry-run=client -o yaml | "${KUBECTL_BIN}" apply -f -
+EOF
+chmod 755 "$RENEW_SCRIPT"
+
+# 매월 1일 03:00 — 잠자기 중이었으면 깨어날 때 실행됨 (인증서 유효기간 90일)
+RENEW_PLIST_NEW=$(cat << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${RENEW_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>${RENEW_SCRIPT}</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Day</key>
+		<integer>1</integer>
+		<key>Hour</key>
+		<integer>3</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>${CERT_DIR}/renew.log</string>
+	<key>StandardErrorPath</key>
+	<string>${CERT_DIR}/renew.log</string>
+</dict>
+</plist>
+EOF
+)
+
+mkdir -p "$(dirname "$RENEW_PLIST")"
+if [ "$(cat "$RENEW_PLIST" 2>/dev/null)" != "$RENEW_PLIST_NEW" ]; then
+    printf '%s\n' "$RENEW_PLIST_NEW" > "$RENEW_PLIST"
+    if launchctl print "${RENEW_DOMAIN}/${RENEW_LABEL}" &>/dev/null; then
+        launchctl bootout "${RENEW_DOMAIN}/${RENEW_LABEL}" 2>/dev/null || true
+        for i in $(seq 1 10); do
+            launchctl print "${RENEW_DOMAIN}/${RENEW_LABEL}" &>/dev/null || break
+            sleep 1
+        done
+    fi
+fi
+if ! launchctl print "${RENEW_DOMAIN}/${RENEW_LABEL}" &>/dev/null; then
+    launchctl bootstrap "$RENEW_DOMAIN" "$RENEW_PLIST" \
+        || err "인증서 갱신 LaunchAgent 등록 실패: launchctl bootstrap ${RENEW_DOMAIN} ${RENEW_PLIST}"
+fi
+log "인증서 자동 갱신 등록 — 매월 1일 03:00 (${RENEW_LABEL}, 로그: ${CERT_DIR}/renew.log)"
+
+# 이전 버전이 등록한 cron 항목은 알리기만 함 (crontab 수정은 권한 창이 뜨므로 자동으로 하지 않음)
+if crontab -l 2>/dev/null | grep -q "tailscale cert"; then
+    warn "이전 버전의 cron 갱신 항목이 남아 있음 — crontab -e로 'tailscale cert' 줄을 지우세요"
 fi
 
 echo ""

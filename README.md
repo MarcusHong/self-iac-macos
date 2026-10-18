@@ -18,7 +18,7 @@ headless 서버로 운영하며, 호스트에 데이터 레이어(PostgreSQL, Va
 | **네트워크** | Tailscale | VPN 메시, MagicDNS, TLS 인증서 |
 | **호스트** | PostgreSQL 18, Valkey, RustFS | 데이터, 캐시, 오브젝트 스토리지(S3) |
 | **K8s** | Traefik, Argo CD, GitLab CE (선택) | Ingress, GitOps, CI/CD |
-| **자동화** | 격월 인증서 갱신 (+ GitLab 사용 시 일일 백업, 주간 Registry GC) | 무인 운영 |
+| **자동화** | 매월 인증서 갱신 (launchd) (+ GitLab 사용 시 일일 백업, 주간 Registry GC) | 무인 운영 |
 
 ### GitLab (선택)
 

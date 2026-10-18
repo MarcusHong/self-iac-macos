@@ -128,13 +128,20 @@ Tailscale의 `tailscale cert` 명령으로 Let's Encrypt 정식 인증서를 발
 ~/.local/share/tailscale-certs/<hostname>.key
 ```
 
-**갱신 cron:** 격월 1일 03:00에 자동 갱신 + K8s Secret 업데이트
+**자동 갱신 (launchd):** 매월 1일 03:00에 인증서를 갱신하고 Traefik의 `tailscale-tls` Secret을 업데이트한다.
+crontab은 수정할 때 macOS 관리 권한 창이 뜨므로 RustFS처럼 LaunchAgent(`local.self-iac.cert-renew`)의
+예약 실행(`StartCalendarInterval`)을 쓴다. 그 시각에 잠자기 중이었으면 깨어날 때 실행된다.
 
-cron의 PATH에는 Homebrew 경로가 없으므로 `tailscale`/`kubectl`은 등록 시점의 절대경로로 기록된다.
+| 항목 | 경로 |
+|------|------|
+| 갱신 스크립트 | `~/.local/share/tailscale-certs/renew.sh` (`tailscale`/`kubectl` 절대경로가 기록됨) |
+| LaunchAgent | `~/Library/LaunchAgents/local.self-iac.cert-renew.plist` |
+| 로그 | `~/.local/share/tailscale-certs/renew.log` |
 
 ```bash
-crontab -l | grep tailscale
-cat ~/.local/share/tailscale-certs/renew.log   # 갱신 로그
+launchctl print gui/$(id -u)/local.self-iac.cert-renew | grep -E 'state|last exit'
+launchctl kickstart gui/$(id -u)/local.self-iac.cert-renew   # 지금 한 번 실행
+cat ~/.local/share/tailscale-certs/renew.log
 ```
 
 ## 완료 후 상태 확인
