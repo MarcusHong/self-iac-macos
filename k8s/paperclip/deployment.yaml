@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paperclip
+  namespace: paperclip
+  labels:
+    app.kubernetes.io/name: paperclip
+spec:
+  replicas: 1
+  # ReadWriteOnce PVC — 새 파드는 기존 파드가 내려간 뒤 띄움
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: paperclip
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: paperclip
+    spec:
+      # 에이전트 실행 정리를 기다림 (공식 compose의 stop_grace_period와 같음)
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: paperclip
+          # v2026.1012.0 — 태그와 digest를 함께 고정
+          image: ghcr.io/paperclipai/paperclip:2026.1012.0@sha256:1661b3dd3fdf7a9b59542d1ced464c3faf9dc8309798b4d15a9923ed32795307
+          ports:
+            - name: http
+              containerPort: 3100
+          env:
+            # 로그인 없음 — local_trusted는 loopback 바인딩만 허용 (port-forward는 파드의 localhost로 연결됨)
+            - name: PAPERCLIP_DEPLOYMENT_MODE
+              value: local_trusted
+            - name: HOST
+              value: 127.0.0.1
+            - name: PORT
+              value: "3100"
+            - name: SERVE_UI
+              value: "true"
+            - name: PAPERCLIP_HOME
+              value: /paperclip
+            # 호스트 PostgreSQL — localhost 전용·로컬 trust라 비밀번호 없음
+            # (파드의 host.docker.internal 연결은 Mac localhost로 들어옴)
+            - name: DATABASE_URL
+              value: postgres://paperclip@host.docker.internal:5432/paperclip
+            # Tailscale Serve로 들어오는 tailnet 호스트명 허용 (${TS_HOSTNAME}은 k8s/deploy.sh가 치환)
+            - name: PAPERCLIP_PUBLIC_URL
+              value: https://${TS_HOSTNAME}:3100
+            - name: PAPERCLIP_ALLOWED_HOSTNAMES
+              value: ${TS_HOSTNAME}
+          volumeMounts:
+            - name: data
+              mountPath: /paperclip
+          # 127.0.0.1에만 리슨하므로 HTTP 프로브 대신 컨테이너 안에서 확인
+          startupProbe:
+            exec:
+              command: ["curl", "-sf", "-o", "/dev/null", "http://127.0.0.1:3100/api/health"]
+            periodSeconds: 10
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: ["curl", "-sf", "-o", "/dev/null", "http://127.0.0.1:3100/api/health"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: paperclip-data

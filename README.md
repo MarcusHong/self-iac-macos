@@ -17,7 +17,7 @@ headless 서버로 운영하며, 호스트에 데이터 레이어(PostgreSQL, Va
 |--------|------|------|
 | **네트워크** | Tailscale | VPN 메시, MagicDNS, TLS 인증서 |
 | **호스트** | PostgreSQL 18, Valkey, RustFS | 데이터, 캐시, 오브젝트 스토리지(S3) |
-| **K8s** | Traefik, Argo CD, GitLab CE (선택) | Ingress, GitOps, CI/CD |
+| **K8s** | Traefik, Argo CD, Paperclip, GitLab CE (선택) | Ingress, GitOps, AI 에이전트 오케스트레이션, CI/CD |
 | **자동화** | 매월 인증서 갱신 (launchd) (+ GitLab 사용 시 일일 백업, 주간 Registry GC) | 무인 운영 |
 
 ### GitLab (선택)
@@ -38,6 +38,7 @@ INSTALL_GITLAB=true ./bootstrap/run.sh
 | RustFS | 1.0.3 (GitHub 릴리스 바이너리, SHA-256 확인) | `01-data.sh` `RUSTFS_VERSION`, `RUSTFS_SHA256` |
 | Traefik | chart 42.0.0 / v3.7.14 | `02-k8s.sh` `TRAEFIK_CHART_VERSION` |
 | Argo CD | chart 10.10.5 / v3.5.5 | `02-k8s.sh` `ARGOCD_CHART_VERSION` |
+| Paperclip | 2026.1012.0 (이미지 digest 고정) | `k8s/paperclip/deployment.yaml` |
 | GitLab CE | chart 10.5.0 / 19.5.0 | `02-k8s.sh` `GITLAB_CHART_VERSION` |
 | GitLab Runner 기본 이미지 | `ubuntu:26.04` | `gitlab-values.yaml` |
 
@@ -56,6 +57,7 @@ Valkey, kubectl, Helm, Argo CD CLI, Tailscale은 설치 시점의 Homebrew 최�
 │  ┌─ OrbStack K8s ─────────┴────────────────────────┐  │
 │  │  Traefik        Ingress + TLS                   │  │
 │  │  Argo CD        GitOps (tailnet :8443, 익명)     │  │
+│  │  Paperclip      AI 에이전트 (tailnet :3100, 익명)│  │
 │  │  GitLab CE      Runner · Registry  (선택)       │  │
 │  │                 Terraform State                 │  │
 │  └─────────────────────────────────────────────────┘  │
@@ -111,6 +113,7 @@ self-iac/
 │   ├── namespace.yaml         # apps namespace
 │   ├── projects/              # AppProject: platform, apps
 │   ├── services/              # 서비스별 OCI Application
+│   ├── paperclip/             # Paperclip (Deployment, PVC — 직접 적용)
 │   └── _template/service/     # 서비스 등록 템플릿
 │
 └── docs/
@@ -137,10 +140,11 @@ self-iac/
 | 구분 | RAM |
 |------|:---:|
 | 호스트 (PG, Valkey, RustFS, macOS) | ~4.6GB |
-| K8s (Traefik, Argo CD, limit 기준) | ~2.3GB |
+| K8s (Traefik, Argo CD, Paperclip, limit 기준) | ~6.3GB |
+| **합계 (GitLab 제외)** | **~10.9GB** |
 | K8s (GitLab, 선택, limit 기준) | +~6GB |
-| **합계 (GitLab 포함)** | **~12.9GB** |
-| **여유 (16GB 기준, GitLab 포함)** | **~3.1GB** |
+
+GitLab까지 켜면 limit 합계가 16GB를 넘는다(실사용은 limit보다 낮음). 둘 다 쓸 때는 메모리를 확인한다.
 
 ## 향후 확장
 

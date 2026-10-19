@@ -1,0 +1,13 @@
+# /paperclip — 에이전트 작업 공간, 업로드 파일, 로컬 시크릿 키, 설정
+# local-path(OrbStack 기본)는 reclaimPolicy=Delete — PVC를 지우면 데이터도 지워진다
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: paperclip-data
+  namespace: paperclip
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

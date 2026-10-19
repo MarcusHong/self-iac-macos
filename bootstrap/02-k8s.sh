@@ -6,7 +6,7 @@ set -uo pipefail
 #
 #   ① Traefik (TLS 종단)
 #   ② GitLab CE (Helm, INSTALL_GITLAB=true 일 때만)
-#   ③ Argo CD (GitOps) + k8s/ 플랫폼 매니페스트 직접 적용
+#   ③ Argo CD (GitOps) + k8s/ 매니페스트 직접 적용 (Paperclip 포함)
 #
 # 01-data.sh가 실행 중이어야 함
 # INSTALL_GITLAB 기본값: false (01-data.sh와 같은 값으로 실행)
@@ -46,13 +46,95 @@ TRAEFIK_CHART_VERSION="42.0.0"   # Traefik v3.7.14
 GITLAB_CHART_VERSION="10.5.0"    # GitLab 19.5.0
 ARGOCD_CHART_VERSION="10.10.5"   # Argo CD v3.5.5
 
-# Argo CD는 익명 admin이라 LAN에 노출하지 않음:
-#   127.0.0.1:8080 (kubectl port-forward LaunchAgent) → Tailscale Serve가 tailnet에만 HTTPS(:8443) 제공
+# 로그인 없는 앱(Argo CD, Paperclip)은 LAN에 노출하지 않음:
+#   127.0.0.1:<로컬 포트> (kubectl port-forward LaunchAgent) → Tailscale Serve가 tailnet에만 HTTPS 제공
 ARGOCD_LOCAL_PORT="8080"
 ARGOCD_TS_PORT="8443"
-ARGOCD_FWD_LABEL="local.self-iac.argocd-forward"
-ARGOCD_FWD_PLIST="$HOME/Library/LaunchAgents/${ARGOCD_FWD_LABEL}.plist"
-ARGOCD_FWD_LOG="$HOME/Library/Logs/self-iac-argocd-forward.log"
+PAPERCLIP_LOCAL_PORT="3100"
+PAPERCLIP_TS_PORT="3100"
+
+# expose_on_tailnet <이름> <namespace> <대상> <로컬 포트> <원격 포트> <tailnet 포트> <health 경로>
+# Tailscale 네트워크 확장은 OrbStack 내부 주소(ClusterIP)로 연결하지 못하므로 127.0.0.1을 거친다.
+# port-forward는 파드가 바뀌면 끊기므로 LaunchAgent(KeepAlive)가 다시 띄운다.
+expose_on_tailnet() {
+    local name="$1" namespace="$2" target="$3" local_port="$4" remote_port="$5" ts_port="$6" health_path="$7"
+    local label="local.self-iac.${name}-forward"
+    local plist="$HOME/Library/LaunchAgents/${label}.plist"
+    local log_file="$HOME/Library/Logs/self-iac-${name}-forward.log"
+    local domain="gui/$(id -u)"
+    local plist_new
+    plist_new=$(cat << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${label}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>${KUBECTL_BIN}</string>
+		<string>--context</string>
+		<string>${KUBE_CONTEXT}</string>
+		<string>-n</string>
+		<string>${namespace}</string>
+		<string>port-forward</string>
+		<string>--address</string>
+		<string>127.0.0.1</string>
+		<string>${target}</string>
+		<string>${local_port}:${remote_port}</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>${log_file}</string>
+	<key>StandardErrorPath</key>
+	<string>${log_file}</string>
+</dict>
+</plist>
+EOF
+)
+    mkdir -p "$(dirname "$plist")"
+    if [ "$(cat "$plist" 2>/dev/null)" != "$plist_new" ]; then
+        printf '%s\n' "$plist_new" > "$plist"
+        if launchctl print "${domain}/${label}" &>/dev/null; then
+            launchctl bootout "${domain}/${label}" 2>/dev/null || true
+            for i in $(seq 1 10); do
+                launchctl print "${domain}/${label}" &>/dev/null || break
+                sleep 1
+            done
+        fi
+    fi
+    if launchctl print "${domain}/${label}" &>/dev/null; then
+        # helm upgrade/배포로 파드가 바뀌었을 수 있으므로 다시 연결
+        launchctl kickstart -k "${domain}/${label}" || err "${name} port-forward 재시작 실패"
+    else
+        launchctl bootstrap "$domain" "$plist" \
+            || err "${name} port-forward LaunchAgent 등록 실패: launchctl bootstrap ${domain} ${plist}"
+    fi
+
+    echo -n "  ${name} port-forward 대기"
+    for i in $(seq 1 60); do
+        if curl -sf -o /dev/null "http://127.0.0.1:${local_port}${health_path}"; then
+            echo ""
+            break
+        fi
+        echo -n "."
+        sleep 2
+        [ "$i" -eq 60 ] && { echo ""; err "${name} port-forward 응답 없음. 로그: ${log_file}"; }
+    done
+    log "${name} — http://127.0.0.1:${local_port} (${label})"
+
+    # tailnet 전용 HTTPS (Funnel 아님) — 설정은 Tailscale이 보관하므로 재부팅 후에도 유지
+    if tailscale serve --bg --https="${ts_port}" "http://127.0.0.1:${local_port}" > /dev/null 2>&1; then
+        log "Tailscale Serve — https://${TS_HOSTNAME}:${ts_port} (tailnet 전용)"
+    else
+        warn "Tailscale Serve 설정 실패 — 이 Mac에서는 http://127.0.0.1:${local_port} 로 접속 가능"
+    fi
+}
 
 step "1/4 사전 체크"
 
@@ -268,89 +350,27 @@ kubectl -n argocd delete secret argocd-initial-admin-secret --ignore-not-found >
 
 "$SCRIPT_DIR/../k8s/deploy.sh" || err "k8s/ 플랫폼 매니페스트 적용 실패"
 
-# ── Argo CD 접속: localhost port-forward(LaunchAgent) + Tailscale Serve(tailnet 전용) ──
-# Tailscale 네트워크 확장은 OrbStack 내부 주소(ClusterIP)로 연결하지 못하므로 127.0.0.1을 거침
+# ── 접속: localhost port-forward(LaunchAgent) + Tailscale Serve(tailnet 전용) ──
 KUBECTL_BIN=$(command -v kubectl)
 KUBE_CONTEXT=$(kubectl config current-context)
-ARGOCD_FWD_PLIST_NEW=$(cat << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>${ARGOCD_FWD_LABEL}</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>${KUBECTL_BIN}</string>
-		<string>--context</string>
-		<string>${KUBE_CONTEXT}</string>
-		<string>-n</string>
-		<string>argocd</string>
-		<string>port-forward</string>
-		<string>--address</string>
-		<string>127.0.0.1</string>
-		<string>svc/argocd-server</string>
-		<string>${ARGOCD_LOCAL_PORT}:80</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>KeepAlive</key>
-	<true/>
-	<key>ThrottleInterval</key>
-	<integer>10</integer>
-	<key>StandardOutPath</key>
-	<string>${ARGOCD_FWD_LOG}</string>
-	<key>StandardErrorPath</key>
-	<string>${ARGOCD_FWD_LOG}</string>
-</dict>
-</plist>
-EOF
-)
 
-ARGOCD_FWD_DOMAIN="gui/$(id -u)"
-mkdir -p "$(dirname "$ARGOCD_FWD_PLIST")"
-if [ "$(cat "$ARGOCD_FWD_PLIST" 2>/dev/null)" != "$ARGOCD_FWD_PLIST_NEW" ]; then
-    printf '%s\n' "$ARGOCD_FWD_PLIST_NEW" > "$ARGOCD_FWD_PLIST"
-    if launchctl print "${ARGOCD_FWD_DOMAIN}/${ARGOCD_FWD_LABEL}" &>/dev/null; then
-        launchctl bootout "${ARGOCD_FWD_DOMAIN}/${ARGOCD_FWD_LABEL}" 2>/dev/null || true
-        for i in $(seq 1 10); do
-            launchctl print "${ARGOCD_FWD_DOMAIN}/${ARGOCD_FWD_LABEL}" &>/dev/null || break
-            sleep 1
-        done
-    fi
-fi
-if launchctl print "${ARGOCD_FWD_DOMAIN}/${ARGOCD_FWD_LABEL}" &>/dev/null; then
-    # helm upgrade로 파드가 바뀌었을 수 있으므로 다시 연결
-    launchctl kickstart -k "${ARGOCD_FWD_DOMAIN}/${ARGOCD_FWD_LABEL}" || err "Argo CD port-forward 재시작 실패"
-else
-    launchctl bootstrap "$ARGOCD_FWD_DOMAIN" "$ARGOCD_FWD_PLIST" \
-        || err "Argo CD port-forward LaunchAgent 등록 실패: launchctl bootstrap ${ARGOCD_FWD_DOMAIN} ${ARGOCD_FWD_PLIST}"
-fi
+expose_on_tailnet argocd argocd svc/argocd-server "$ARGOCD_LOCAL_PORT" 80 "$ARGOCD_TS_PORT" /healthz
 
-echo -n "  Argo CD port-forward 대기"
-for i in $(seq 1 30); do
-    if curl -sf "http://127.0.0.1:${ARGOCD_LOCAL_PORT}/healthz" &>/dev/null; then
-        echo ""
-        break
-    fi
-    echo -n "."
-    sleep 1
-    [ "$i" -eq 30 ] && { echo ""; err "Argo CD port-forward 응답 없음. 로그: ${ARGOCD_FWD_LOG}"; }
-done
-log "Argo CD — http://127.0.0.1:${ARGOCD_LOCAL_PORT} (${ARGOCD_FWD_LABEL})"
-
-# tailnet 전용 HTTPS (Funnel 아님) — 설정은 Tailscale이 보관하므로 재부팅 후에도 유지
-if tailscale serve --bg --https="${ARGOCD_TS_PORT}" "http://127.0.0.1:${ARGOCD_LOCAL_PORT}" > /dev/null 2>&1; then
-    log "Tailscale Serve — https://${TS_HOSTNAME}:${ARGOCD_TS_PORT} (tailnet 전용)"
-else
-    warn "Tailscale Serve 설정 실패 — 이 Mac에서는 http://127.0.0.1:${ARGOCD_LOCAL_PORT} 로 접속 가능"
-fi
+# Paperclip (k8s/paperclip, deploy.sh가 적용) — 첫 배포는 이미지 pull과 DB 마이그레이션으로 오래 걸릴 수 있음
+echo "  Paperclip 배포 대기 (최대 15분)..."
+kubectl -n paperclip rollout status deploy/paperclip --timeout=15m || err "Paperclip 배포 실패 — kubectl -n paperclip logs deploy/paperclip"
+expose_on_tailnet paperclip paperclip deploy/paperclip "$PAPERCLIP_LOCAL_PORT" 3100 "$PAPERCLIP_TS_PORT" /api/health
 
 echo ""
 echo "  Argo CD UI (로그인 없음):"
 echo "    tailnet:  https://${TS_HOSTNAME}:${ARGOCD_TS_PORT}"
 echo "    이 Mac:   http://127.0.0.1:${ARGOCD_LOCAL_PORT}"
 echo "  CLI (로그인 없음): ARGOCD_OPTS=\"--server ${TS_HOSTNAME}:${ARGOCD_TS_PORT} --grpc-web\" argocd app list"
+echo ""
+echo "  Paperclip (로그인 없음):"
+echo "    tailnet:  https://${TS_HOSTNAME}:${PAPERCLIP_TS_PORT}"
+echo "    이 Mac:   http://127.0.0.1:${PAPERCLIP_LOCAL_PORT}"
+echo "    Claude/Codex 연결: Apps → Connections"
 
 echo ""
 echo "  서비스 배포: 서비스 CI가 *-deploy OCI 아티팩트를 발행하고, 서비스별 Application이 동기화합니다."
@@ -364,6 +384,8 @@ if [ "$INSTALL_GITLAB" = "true" ]; then
     echo ""
 fi
 kubectl get pods -n argocd 2>/dev/null
+echo ""
+kubectl get pods -n paperclip 2>/dev/null
 
 echo ""
 echo "  ┌──────────────────────────────────────────────┐"
@@ -377,6 +399,7 @@ echo "  │  ├─ Traefik   https://${TS_HOSTNAME}"
 if [ "$INSTALL_GITLAB" = "true" ]; then
 echo "  │  ├─ GitLab    https://${GITLAB_HOST}"
 fi
-echo "  │  └─ Argo CD   https://${TS_HOSTNAME}:${ARGOCD_TS_PORT} (tailnet 전용)"
+echo "  │  ├─ Argo CD   https://${TS_HOSTNAME}:${ARGOCD_TS_PORT} (tailnet 전용)"
+echo "  │  └─ Paperclip https://${TS_HOSTNAME}:${PAPERCLIP_TS_PORT} (tailnet 전용)"
 echo "  └──────────────────────────────────────────────┘"
 echo ""

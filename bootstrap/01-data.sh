@@ -148,6 +148,21 @@ EOSQL
     log "gitlab 유저/DB + 확장 모듈 준비 (비밀번호 없음, 로컬 trust)"
 fi
 
+# Paperclip (k8s/paperclip) — 비밀번호 없는 paperclip 유저/DB
+psql -v ON_ERROR_STOP=1 -d postgres > /dev/null << EOSQL || err "PostgreSQL paperclip 유저 생성 실패"
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'paperclip') THEN
+        CREATE ROLE paperclip WITH LOGIN;
+    END IF;
+END
+\$\$;
+EOSQL
+if [ "$(psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'paperclip';")" != "1" ]; then
+    createdb -O paperclip paperclip || err "PostgreSQL paperclip DB 생성 실패"
+fi
+log "paperclip 유저/DB 준비 (비밀번호 없음, 로컬 trust)"
+
 PG_DATA_DIR="$(brew --prefix)/var/postgresql@${PG_VERSION}"
 
 # GitLab은 100개 이상의 커넥션을 사용하므로 여유 있게 설정

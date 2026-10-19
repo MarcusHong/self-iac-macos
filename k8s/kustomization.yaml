@@ -1,4 +1,4 @@
-# k8s/deploy.sh가 렌더 결과를 검사한 뒤 직접 적용합니다.
+# k8s/deploy.sh가 렌더 후 ${TS_HOSTNAME}을 치환하고 검사한 뒤 직접 적용합니다.
 # 이 디렉터리는 Argo CD source가 아닙니다.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -7,3 +7,4 @@ resources:
   - projects/platform.yaml
   - projects/apps.yaml
   - services
+  - paperclip

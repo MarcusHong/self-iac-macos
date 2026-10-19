@@ -1,0 +1,9 @@
+# Paperclip — AI 에이전트 오케스트레이션 (https://github.com/paperclipai/paperclip)
+# 로그인 없는 local_trusted 모드로 파드 안 127.0.0.1:3100에만 리슨한다.
+# 02-k8s.sh가 127.0.0.1 port-forward(LaunchAgent) + Tailscale Serve로 tailnet에만 노출한다.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - pvc.yaml
+  - deployment.yaml

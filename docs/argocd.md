@@ -13,6 +13,7 @@ builders-starter-iac와 같은 구성을 따른다. IaC 저장소(이 저장소)
 | `k8s/`의 raw 리소스 (Namespace, AppProject, Ingress) | `./k8s/deploy.sh`로 직접 적용 | 관리하지 않음 |
 | 플랫폼 Helm 컴포넌트 (Operator·모니터링, 향후) | `k8s/`에 Application CR을 추가해 직접 적용 | 공개 Helm source를 `prune`·`selfHeal` |
 | 서비스 | `k8s/services/<service>`에 repository Secret + Application | `*-deploy` OCI를 `prune`·`selfHeal` |
+| Paperclip | `k8s/paperclip` raw 매니페스트를 `./k8s/deploy.sh`로 직접 적용 | 관리하지 않음 |
 
 - **AppProject**: `platform`은 `monitoring`, `operators`, `kube-system`만, `apps`는 `apps` namespace만 허용한다.
 - **apps 제한**: `apps`는 NetworkPolicy, namespaced SecretStore와 generator 리소스를 허용하지 않는다.

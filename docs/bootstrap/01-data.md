@@ -38,7 +38,8 @@ brew services start postgresql@18
 기본 설정 그대로 `localhost`에만 리슨하고, Homebrew가 만든 `pg_hba.conf`(로컬·`127.0.0.1` trust)를 그대로 쓴다.
 관리는 macOS 계정으로 로컬 접속한다 (`psql -d postgres`). 별도 관리용 유저나 비밀번호는 만들지 않는다.
 
-`INSTALL_GITLAB=true`이면 비밀번호 없는 `gitlab` 유저(LOGIN, CREATEDB)와 `gitlab` DB를 만든다.
+Paperclip용으로 비밀번호 없는 `paperclip` 유저(LOGIN)와 `paperclip` DB를 항상 만든다.
+`INSTALL_GITLAB=true`이면 비밀번호 없는 `gitlab` 유저(LOGIN, CREATEDB)와 `gitlab` DB도 만든다.
 GitLab 파드는 `host.docker.internal:5432`로 접속하며, 이 연결은 Mac localhost로 들어와 trust로 인증된다.
 
 **확장 모듈:** `pg_trgm`, `btree_gist` (GitLab DB, `INSTALL_GITLAB=true`일 때)
