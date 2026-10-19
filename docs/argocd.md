@@ -20,7 +20,7 @@ builders-starter-iac와 같은 구성을 따른다. IaC 저장소(이 저장소)
 - **선택 컴포넌트**: ApplicationSet controller는 replica 0, Dex는 설치하지 않는다.
   Notifications controller는 활성화하지만 notifier와 구독은 별도 설정이다.
 - **인증 없음**: 익명 사용자가 admin 권한을 가지며 admin 계정은 꺼져 있다.
-- **노출 없음**: Ingress가 없고 `kubectl port-forward`로만 접속한다. K8s API에 접근할 수 있는 사람만 쓸 수 있다.
+- **tailnet 전용**: Ingress가 없고, `127.0.0.1:8080` port-forward를 Tailscale Serve가 tailnet에만 `https://<tailscale-hostname>:8443`으로 제공한다. LAN에는 열리지 않으며, tailnet의 모든 기기가 admin 권한을 가진다.
 
 ## 플랫폼 매니페스트 직접 적용
 
@@ -111,15 +111,27 @@ Argo CD는 이동 tag의 digest 변화를 감지한다(`timeout.reconciliation: 
 
 ```bash
 # UI — 로그인 없음 (익명 admin)
-kubectl -n argocd port-forward svc/argocd-server 8080:80
-# → http://localhost:8080
+#   tailnet 기기:  https://<tailscale-hostname>:8443
+#   서버 Mac:      http://127.0.0.1:8080
 
-# 랩탑에서 (client.sh로 만든 context)
-kubectl --context=orbstack-remote -n argocd port-forward svc/argocd-server 8080:80
-
-# CLI — 내장 port-forward로 접속 (로그인 불필요). ~/.zshrc 등에 두면 argocd app list처럼 바로 사용
-export ARGOCD_OPTS="--port-forward --port-forward-namespace argocd --plaintext"
+# CLI — 로그인 불필요. ~/.zshrc 등에 두면 argocd app list처럼 바로 사용
+export ARGOCD_OPTS="--server <tailscale-hostname>:8443 --grpc-web"
 argocd app list
+```
+
+| 구성 | 내용 |
+|------|------|
+| port-forward | LaunchAgent `local.self-iac.argocd-forward` — `kubectl port-forward --address 127.0.0.1 svc/argocd-server 8080:80` (KeepAlive, 로그 `~/Library/Logs/self-iac-argocd-forward.log`) |
+| Tailscale Serve | `tailscale serve --bg --https=8443 http://127.0.0.1:8080` — tailnet 전용(Funnel 아님), 설정은 Tailscale이 보관 |
+
+Traefik IP 허용 목록으로는 제한할 수 없다. OrbStack LoadBalancer를 거치면 localhost·LAN·tailnet 접속이 모두
+같은 출발지 IP(OrbStack 게이트웨이)로 보이기 때문이다. Tailscale 네트워크 확장은 OrbStack 내부 주소(ClusterIP)로
+연결하지 못하므로 Serve의 백엔드는 `127.0.0.1` port-forward를 거친다.
+
+```bash
+tailscale serve status
+launchctl print gui/$(id -u)/local.self-iac.argocd-forward | grep -E 'state|pid'
+launchctl kickstart -k gui/$(id -u)/local.self-iac.argocd-forward   # 다시 연결
 ```
 
 ## 상태 확인
@@ -154,7 +166,7 @@ kubectl -n argocd get application <name> -o jsonpath='{.status.conditions}'
 | OCI `revision not found` | `targetRevision` 태그가 `*-deploy` 저장소에 발행됐는지 |
 | OCI `unauthorized` | `repo-creds` Secret의 url prefix와 자격증명 |
 | 서비스만 `Unknown` | 이미지뿐 아니라 `*-deploy` 아티팩트도 발행했는지 |
-| UI 접속 안 됨 | `kubectl -n argocd port-forward svc/argocd-server 8080:80`이 실행 중인지, `argocd-server` 파드 상태 |
+| UI 접속 안 됨 | `tailscale serve status`, port-forward 에이전트 상태(`launchctl kickstart -k ...argocd-forward`), `argocd-server` 파드 |
 
 ## 롤백
 

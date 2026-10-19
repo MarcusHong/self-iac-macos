@@ -3,8 +3,9 @@
 # builders-starter-iac의 Argo CD 구성을 따른다.
 #
 # 비밀번호 없이 운영: 익명 사용자에게 admin 권한을 주고 admin 계정은 끈다.
-# 대신 네트워크에 노출하지 않는다 (Ingress 없음) — kubectl port-forward로만 접속:
-#   kubectl -n argocd port-forward svc/argocd-server 8080:80  → http://localhost:8080
+# 대신 LAN에 노출하지 않는다 (Ingress 없음). 02-k8s.sh가 설정:
+#   127.0.0.1:8080 kubectl port-forward (LaunchAgent) → Tailscale Serve https://<TS_HOSTNAME>:8443 (tailnet 전용)
+# (configs.cm.url은 02-k8s.sh가 tailnet 주소로 주입)
 # ================================================
 
 dex:

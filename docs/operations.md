@@ -8,7 +8,7 @@
 | Valkey | `valkey-cli` |
 | RustFS (S3) | http://127.0.0.1:9000 (서버 localhost 전용) |
 | RustFS 콘솔 | http://localhost:9001/rustfs/console/ (랩탑에서는 `ssh -L 9001:127.0.0.1:9001 <server>`, `rustfsadmin`/`rustfsadmin`으로 로그인) |
-| Argo CD | `kubectl -n argocd port-forward svc/argocd-server 8080:80` → http://localhost:8080 (로그인 없음) |
+| Argo CD | https://<tailscale-hostname>:8443 (tailnet 전용, 로그인 없음) · 서버에서는 http://127.0.0.1:8080 |
 | GitLab (선택) | https://<tailscale-hostname> |
 | Registry (GitLab 사용 시) | `docker login <tailscale-hostname>:5050` (Traefik `registry` 엔트리포인트, TLS) |
 

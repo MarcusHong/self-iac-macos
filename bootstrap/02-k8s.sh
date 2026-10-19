@@ -46,6 +46,14 @@ TRAEFIK_CHART_VERSION="42.0.0"   # Traefik v3.7.14
 GITLAB_CHART_VERSION="10.5.0"    # GitLab 19.5.0
 ARGOCD_CHART_VERSION="10.10.5"   # Argo CD v3.5.5
 
+# Argo CD는 익명 admin이라 LAN에 노출하지 않음:
+#   127.0.0.1:8080 (kubectl port-forward LaunchAgent) → Tailscale Serve가 tailnet에만 HTTPS(:8443) 제공
+ARGOCD_LOCAL_PORT="8080"
+ARGOCD_TS_PORT="8443"
+ARGOCD_FWD_LABEL="local.self-iac.argocd-forward"
+ARGOCD_FWD_PLIST="$HOME/Library/LaunchAgents/${ARGOCD_FWD_LABEL}.plist"
+ARGOCD_FWD_LOG="$HOME/Library/Logs/self-iac-argocd-forward.log"
+
 step "1/4 사전 체크"
 
 for cmd in kubectl helm; do
@@ -244,11 +252,12 @@ kubectl create namespace argocd 2>/dev/null || true
 
 # builders-starter-iac와 같은 구성: Argo CD는 Helm으로 설치하고,
 # AppProject·서비스 Application은 k8s/에서 직접 적용 (IaC 저장소는 Argo CD source가 아님)
-# 비밀번호 없이 익명 admin으로 운영하므로 네트워크에 노출하지 않음 (Ingress 없음, port-forward로 접속)
+# 비밀번호 없이 익명 admin으로 운영하므로 Ingress로 노출하지 않음 (아래 port-forward + Tailscale Serve)
 helm upgrade --install argocd oci://ghcr.io/argoproj/argo-helm/argo-cd \
     --version "$ARGOCD_CHART_VERSION" \
     --namespace argocd \
     -f "$SCRIPT_DIR/argocd-values.yaml" \
+    --set configs.cm.url="https://${TS_HOSTNAME}:${ARGOCD_TS_PORT}" \
     --wait --timeout 10m || err "Argo CD 설치 실패"
 
 log "Argo CD 설치 완료"
@@ -259,11 +268,89 @@ kubectl -n argocd delete secret argocd-initial-admin-secret --ignore-not-found >
 
 "$SCRIPT_DIR/../k8s/deploy.sh" || err "k8s/ 플랫폼 매니페스트 적용 실패"
 
+# ── Argo CD 접속: localhost port-forward(LaunchAgent) + Tailscale Serve(tailnet 전용) ──
+# Tailscale 네트워크 확장은 OrbStack 내부 주소(ClusterIP)로 연결하지 못하므로 127.0.0.1을 거침
+KUBECTL_BIN=$(command -v kubectl)
+KUBE_CONTEXT=$(kubectl config current-context)
+ARGOCD_FWD_PLIST_NEW=$(cat << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${ARGOCD_FWD_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>${KUBECTL_BIN}</string>
+		<string>--context</string>
+		<string>${KUBE_CONTEXT}</string>
+		<string>-n</string>
+		<string>argocd</string>
+		<string>port-forward</string>
+		<string>--address</string>
+		<string>127.0.0.1</string>
+		<string>svc/argocd-server</string>
+		<string>${ARGOCD_LOCAL_PORT}:80</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>${ARGOCD_FWD_LOG}</string>
+	<key>StandardErrorPath</key>
+	<string>${ARGOCD_FWD_LOG}</string>
+</dict>
+</plist>
+EOF
+)
+
+ARGOCD_FWD_DOMAIN="gui/$(id -u)"
+mkdir -p "$(dirname "$ARGOCD_FWD_PLIST")"
+if [ "$(cat "$ARGOCD_FWD_PLIST" 2>/dev/null)" != "$ARGOCD_FWD_PLIST_NEW" ]; then
+    printf '%s\n' "$ARGOCD_FWD_PLIST_NEW" > "$ARGOCD_FWD_PLIST"
+    if launchctl print "${ARGOCD_FWD_DOMAIN}/${ARGOCD_FWD_LABEL}" &>/dev/null; then
+        launchctl bootout "${ARGOCD_FWD_DOMAIN}/${ARGOCD_FWD_LABEL}" 2>/dev/null || true
+        for i in $(seq 1 10); do
+            launchctl print "${ARGOCD_FWD_DOMAIN}/${ARGOCD_FWD_LABEL}" &>/dev/null || break
+            sleep 1
+        done
+    fi
+fi
+if launchctl print "${ARGOCD_FWD_DOMAIN}/${ARGOCD_FWD_LABEL}" &>/dev/null; then
+    # helm upgrade로 파드가 바뀌었을 수 있으므로 다시 연결
+    launchctl kickstart -k "${ARGOCD_FWD_DOMAIN}/${ARGOCD_FWD_LABEL}" || err "Argo CD port-forward 재시작 실패"
+else
+    launchctl bootstrap "$ARGOCD_FWD_DOMAIN" "$ARGOCD_FWD_PLIST" \
+        || err "Argo CD port-forward LaunchAgent 등록 실패: launchctl bootstrap ${ARGOCD_FWD_DOMAIN} ${ARGOCD_FWD_PLIST}"
+fi
+
+echo -n "  Argo CD port-forward 대기"
+for i in $(seq 1 30); do
+    if curl -sf "http://127.0.0.1:${ARGOCD_LOCAL_PORT}/healthz" &>/dev/null; then
+        echo ""
+        break
+    fi
+    echo -n "."
+    sleep 1
+    [ "$i" -eq 30 ] && { echo ""; err "Argo CD port-forward 응답 없음. 로그: ${ARGOCD_FWD_LOG}"; }
+done
+log "Argo CD — http://127.0.0.1:${ARGOCD_LOCAL_PORT} (${ARGOCD_FWD_LABEL})"
+
+# tailnet 전용 HTTPS (Funnel 아님) — 설정은 Tailscale이 보관하므로 재부팅 후에도 유지
+if tailscale serve --bg --https="${ARGOCD_TS_PORT}" "http://127.0.0.1:${ARGOCD_LOCAL_PORT}" > /dev/null 2>&1; then
+    log "Tailscale Serve — https://${TS_HOSTNAME}:${ARGOCD_TS_PORT} (tailnet 전용)"
+else
+    warn "Tailscale Serve 설정 실패 — 이 Mac에서는 http://127.0.0.1:${ARGOCD_LOCAL_PORT} 로 접속 가능"
+fi
+
 echo ""
 echo "  Argo CD UI (로그인 없음):"
-echo "    kubectl -n argocd port-forward svc/argocd-server 8080:80   → http://localhost:8080"
-echo "    랩탑에서는 client.sh로 만든 context 사용: kubectl --context=orbstack-remote -n argocd port-forward ..."
-echo "  CLI (로그인 없음): ARGOCD_OPTS=\"--port-forward --port-forward-namespace argocd --plaintext\" argocd app list"
+echo "    tailnet:  https://${TS_HOSTNAME}:${ARGOCD_TS_PORT}"
+echo "    이 Mac:   http://127.0.0.1:${ARGOCD_LOCAL_PORT}"
+echo "  CLI (로그인 없음): ARGOCD_OPTS=\"--server ${TS_HOSTNAME}:${ARGOCD_TS_PORT} --grpc-web\" argocd app list"
 
 echo ""
 echo "  서비스 배포: 서비스 CI가 *-deploy OCI 아티팩트를 발행하고, 서비스별 Application이 동기화합니다."
@@ -290,6 +377,6 @@ echo "  │  ├─ Traefik   https://${TS_HOSTNAME}"
 if [ "$INSTALL_GITLAB" = "true" ]; then
 echo "  │  ├─ GitLab    https://${GITLAB_HOST}"
 fi
-echo "  │  └─ Argo CD   port-forward → http://localhost:8080"
+echo "  │  └─ Argo CD   https://${TS_HOSTNAME}:${ARGOCD_TS_PORT} (tailnet 전용)"
 echo "  └──────────────────────────────────────────────┘"
 echo ""
